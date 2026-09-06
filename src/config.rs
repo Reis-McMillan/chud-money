@@ -1,0 +1,97 @@
+//! Process configuration, loaded from the environment (and `.env` via dotenvy).
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+
+/// Kalshi REST + websocket base URLs for one environment.
+#[derive(Clone, Copy, Debug)]
+pub struct KalshiEndpoints {
+    pub rest: &'static str,
+    pub ws: &'static str,
+}
+
+pub const PROD: KalshiEndpoints = KalshiEndpoints {
+    rest: "https://external-api.kalshi.com",
+    ws: "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
+};
+
+pub const DEMO: KalshiEndpoints = KalshiEndpoints {
+    rest: "https://demo-api.kalshi.co",
+    ws: "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KalshiEnv {
+    Prod,
+    Demo,
+}
+
+impl KalshiEnv {
+    pub fn endpoints(self) -> KalshiEndpoints {
+        match self {
+            KalshiEnv::Prod => PROD,
+            KalshiEnv::Demo => DEMO,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KalshiEnv::Prod => "prod",
+            KalshiEnv::Demo => "demo",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub bind_addr: String,
+    /// Base used to compose the proxy websocket URLs stored in market documents,
+    /// e.g. `ws://localhost:3000`.
+    pub public_ws_base: String,
+    pub mongo_uri: String,
+    pub mongo_db: String,
+    /// Passed verbatim to `questdb::ingress::Sender::from_conf`.
+    pub questdb_ilp_conf: String,
+    /// libpq-style connection string for QuestDB's PGWire port.
+    pub questdb_pg_conninfo: String,
+    pub kalshi_env: KalshiEnv,
+    pub kalshi_key_id: String,
+    pub kalshi_key_path: String,
+}
+
+fn var_or(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self> {
+        let kalshi_env = match var_or("KALSHI_ENV", "demo").as_str() {
+            "prod" => KalshiEnv::Prod,
+            "demo" => KalshiEnv::Demo,
+            other => anyhow::bail!("KALSHI_ENV must be 'prod' or 'demo', got {other:?}"),
+        };
+        let pg_host = var_or("QUESTDB_PG_HOST", "localhost");
+        let pg_port = var_or("QUESTDB_PG_PORT", "8812");
+        let pg_user = var_or("QUESTDB_PG_USER", "admin");
+        let pg_password = var_or("QUESTDB_PG_PASSWORD", "quest");
+        let pg_db = var_or("QUESTDB_PG_DB", "qdb");
+
+        Ok(Self {
+            bind_addr: var_or("BIND_ADDR", "0.0.0.0:3000"),
+            public_ws_base: var_or("PUBLIC_WS_BASE", "ws://localhost:3000")
+                .trim_end_matches('/')
+                .to_string(),
+            mongo_uri: var_or("MONGO_URI", "mongodb://localhost:27017"),
+            mongo_db: var_or("MONGO_DB", "chud"),
+            questdb_ilp_conf: var_or("QUESTDB_ILP_CONF", "http::addr=localhost:9000;"),
+            questdb_pg_conninfo: format!(
+                "host={pg_host} port={pg_port} user={pg_user} password={pg_password} dbname={pg_db}"
+            ),
+            kalshi_env,
+            kalshi_key_id: std::env::var("KALSHI_API_KEY_ID")
+                .context("set KALSHI_API_KEY_ID to your Kalshi API key id")?,
+            kalshi_key_path: var_or("KALSHI_PRIVATE_KEY_PATH", "kalshi_key.pem"),
+        })
+    }
+}

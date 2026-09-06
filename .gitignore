@@ -1,0 +1,4 @@
+/target
+.env.local
+.env.prod
+*.pem
