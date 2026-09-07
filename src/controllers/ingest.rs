@@ -12,7 +12,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -30,18 +30,90 @@ const MAX_RATE_LIMIT_RETRIES: u32 = 5;
 
 pub type IngestJobs = Arc<RwLock<HashMap<String, IngestJob>>>;
 
+/// Every request uses the smallest window the pass-through allows, which is
+/// also where CF Benchmarks returns its finest resolution.
+const INGEST_TIMESPAN: Timespan = Timespan::Hour;
+
 #[derive(Debug, Deserialize)]
 pub struct IngestRequest {
     pub tag: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    /// Upstream granularity/window, e.g. `1s`, `1m`, `1h`, `1d`.
-    #[serde(default = "default_timespan")]
-    pub timespan: String,
 }
 
-fn default_timespan() -> String {
-    "1m".to_string()
+/// One CF Benchmarks history window (`HOUR`, `DAY`, `MONTH` or `YEAR`, the
+/// only values the pass-through accepts). The upstream API requires
+/// `timestamp` to be the start of a period, so cursors are floored to calendar
+/// boundaries in UTC and advanced one period at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // only HOUR is requested today; the others stay tested and available
+pub enum Timespan {
+    Hour,
+    Day,
+    Month,
+    Year,
+}
+
+impl Timespan {
+    #[cfg(test)]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "HOUR" => Some(Self::Hour),
+            "DAY" => Some(Self::Day),
+            "MONTH" => Some(Self::Month),
+            "YEAR" => Some(Self::Year),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "HOUR",
+            Self::Day => "DAY",
+            Self::Month => "MONTH",
+            Self::Year => "YEAR",
+        }
+    }
+
+    /// Start of the period containing `ms`.
+    pub fn floor(self, ms: i64) -> i64 {
+        match self {
+            Self::Hour => ms - ms.rem_euclid(3_600_000),
+            Self::Day => ms - ms.rem_euclid(86_400_000),
+            Self::Month => {
+                let d = DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().date_naive();
+                ymd_ms(d.year(), d.month())
+            }
+            Self::Year => {
+                let d = DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().date_naive();
+                ymd_ms(d.year(), 1)
+            }
+        }
+    }
+
+    /// Start of the period after the one starting at `period_start_ms`.
+    pub fn next(self, period_start_ms: i64) -> i64 {
+        match self {
+            Self::Hour => period_start_ms + 3_600_000,
+            Self::Day => period_start_ms + 86_400_000,
+            Self::Month => {
+                let d = DateTime::<Utc>::from_timestamp_millis(period_start_ms).unwrap_or_default().date_naive();
+                if d.month() == 12 { ymd_ms(d.year() + 1, 1) } else { ymd_ms(d.year(), d.month() + 1) }
+            }
+            Self::Year => {
+                let d = DateTime::<Utc>::from_timestamp_millis(period_start_ms).unwrap_or_default().date_naive();
+                ymd_ms(d.year() + 1, 1)
+            }
+        }
+    }
+}
+
+/// Midnight UTC on the first of the month, in ms.
+fn ymd_ms(year: i32, month: u32) -> i64 {
+    NaiveDate::from_ymd_opt(year, month, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp_millis())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,30 +150,12 @@ pub struct IngestAccepted {
     pub end_ms: i64,
 }
 
-/// Parse `<n><unit>` where unit is one of `ms`, `s`, `m`, `h`, `d`.
-pub fn timespan_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let split = s.find(|c: char| !c.is_ascii_digit())?;
-    let (n, unit) = s.split_at(split);
-    let n: i64 = n.parse().ok()?;
-    let mult = match unit {
-        "ms" => 1,
-        "s" => 1_000,
-        "m" => 60_000,
-        "h" => 3_600_000,
-        "d" => 86_400_000,
-        _ => return None,
-    };
-    (n > 0).then_some(n * mult)
-}
-
 /// `POST /ingest` — start a backfill job for a market's index.
 pub async fn start(
     State(state): State<AppState>,
     Json(req): Json<IngestRequest>,
 ) -> Result<(StatusCode, Json<IngestAccepted>), AppError> {
-    let span_ms = timespan_ms(&req.timespan)
-        .ok_or_else(|| AppError::BadRequest(format!("invalid timespan '{}'", req.timespan)))?;
+    let timespan = INGEST_TIMESPAN;
     if req.end <= req.start {
         return Err(AppError::BadRequest("end must be after start".into()));
     }
@@ -110,13 +164,13 @@ pub async fn start(
         .ok_or_else(|| AppError::NotFound(format!("market '{}'", req.tag)))?;
 
     let start_ms = req.start.timestamp_millis();
-    let cursor_ms = start_ms - start_ms.rem_euclid(span_ms);
+    let cursor_ms = timespan.floor(start_ms);
     let job = IngestJob {
         job_id: uuid::Uuid::new_v4().to_string(),
         tag: market.tag.clone(),
         index_id: market.index_id.clone(),
         status: JobStatus::Running,
-        timespan: req.timespan.clone(),
+        timespan: timespan.as_str().to_string(),
         start_ms,
         end_ms: req.end.timestamp_millis(),
         cursor_ms,
@@ -145,7 +199,7 @@ pub async fn start(
         cursor_ms,
         end_ms: job.end_ms,
     };
-    tokio::spawn(run_job(state.clone(), job, span_ms));
+    tokio::spawn(run_job(state.clone(), job, timespan));
     Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
@@ -164,9 +218,9 @@ pub async fn status(
         .ok_or_else(|| AppError::NotFound(format!("ingest job '{job_id}'")))
 }
 
-async fn run_job(state: AppState, mut job: IngestJob, span_ms: i64) {
+async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan) {
     let job_id = job.job_id.clone();
-    let outcome = ingest_loop(&state, &mut job, span_ms).await;
+    let outcome = ingest_loop(&state, &mut job, timespan).await;
     job.finished_at = Some(Utc::now());
     match outcome {
         Ok(()) => {
@@ -182,7 +236,7 @@ async fn run_job(state: AppState, mut job: IngestJob, span_ms: i64) {
     state.ingest_jobs.write().await.insert(job_id, job);
 }
 
-async fn ingest_loop(state: &AppState, job: &mut IngestJob, span_ms: i64) -> anyhow::Result<()> {
+async fn ingest_loop(state: &AppState, job: &mut IngestJob, timespan: Timespan) -> anyhow::Result<()> {
     let mut rate_limit_hits = 0u32;
     let mut logged_sample = false;
 
@@ -213,7 +267,6 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, span_ms: i64) -> any
             tracing::info!(job_id = %job.job_id, parsed = values.len(), %sample, "first pass-through payload");
         }
 
-        let mut last_time = None;
         for v in values.iter().filter(|v| v.time_ms >= job.start_ms && v.time_ms < job.end_ms) {
             let row = IndexRow {
                 table: Table::Hist,
@@ -225,11 +278,11 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, span_ms: i64) -> any
             };
             state.questdb.ilp.send(row).await.map_err(|_| anyhow::anyhow!("ilp writer gone"))?;
             job.rows += 1;
-            last_time = Some(v.time_ms);
         }
 
-        // Advance at least one window; further if the upstream returned more.
-        job.cursor_ms = (job.cursor_ms + span_ms).max(last_time.map(|t| t + 1).unwrap_or(0));
+        // Always step to the next aligned period; the upstream rejects
+        // unaligned timestamps and QuestDB dedups on (ts, index_id).
+        job.cursor_ms = timespan.next(job.cursor_ms);
         state.ingest_jobs.write().await.insert(job.job_id.clone(), job.clone());
 
         tokio::time::sleep(REQUEST_GAP).await;
@@ -239,17 +292,32 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, span_ms: i64) -> any
 
 #[cfg(test)]
 mod tests {
-    use super::timespan_ms;
+    use super::Timespan;
 
     #[test]
     fn parses_timespans() {
-        assert_eq!(timespan_ms("200ms"), Some(200));
-        assert_eq!(timespan_ms("1s"), Some(1_000));
-        assert_eq!(timespan_ms("15m"), Some(900_000));
-        assert_eq!(timespan_ms("1h"), Some(3_600_000));
-        assert_eq!(timespan_ms("1d"), Some(86_400_000));
-        assert_eq!(timespan_ms("0m"), None);
-        assert_eq!(timespan_ms("1w"), None);
-        assert_eq!(timespan_ms("m"), None);
+        assert_eq!(Timespan::parse("HOUR"), Some(Timespan::Hour));
+        assert_eq!(Timespan::parse(" day "), Some(Timespan::Day));
+        assert_eq!(Timespan::parse("Month"), Some(Timespan::Month));
+        assert_eq!(Timespan::parse("year"), Some(Timespan::Year));
+        assert_eq!(Timespan::parse("1m"), None);
+        assert_eq!(Timespan::parse("WEEK"), None);
+        assert_eq!(Timespan::parse(""), None);
+    }
+
+    #[test]
+    fn aligns_and_advances_periods() {
+        // 2026-09-06T23:36:46.855Z
+        let ms = 1_788_737_806_855;
+        assert_eq!(Timespan::Hour.floor(ms), 1_788_735_600_000); // 23:00Z
+        assert_eq!(Timespan::Hour.next(Timespan::Hour.floor(ms)), 1_788_739_200_000);
+        assert_eq!(Timespan::Day.floor(ms), 1_788_652_800_000); // 2026-09-06T00:00Z
+        assert_eq!(Timespan::Month.floor(ms), 1_788_220_800_000); // 2026-09-01
+        assert_eq!(Timespan::Month.next(Timespan::Month.floor(ms)), 1_790_812_800_000); // 2026-10-01
+        assert_eq!(Timespan::Year.floor(ms), 1_767_225_600_000); // 2026-01-01
+        assert_eq!(Timespan::Year.next(Timespan::Year.floor(ms)), 1_798_761_600_000); // 2027-01-01
+        // December rolls the year.
+        let dec = Timespan::Month.floor(1_798_000_000_000); // 2026-12-...
+        assert_eq!(Timespan::Month.next(dec), 1_798_761_600_000);
     }
 }

@@ -22,7 +22,7 @@ pub async fn ticker(
 ) -> Result<Response, AppError> {
     let feed = state.feeds.get(&tag).await.ok_or_else(|| AppError::NotFound(format!("feed for '{tag}'")))?;
     let rx = feed.ticker_tx.subscribe();
-    Ok(ws.on_upgrade(move |socket| pump(socket, rx, tag, "ticker")))
+    Ok(ws.on_upgrade(move |socket| pump(socket, rx, Vec::new(), tag, "ticker")))
 }
 
 /// `GET /ws/{tag}/orderbook`
@@ -32,12 +32,30 @@ pub async fn orderbook(
     ws: WebSocketUpgrade,
 ) -> Result<Response, AppError> {
     let feed = state.feeds.get(&tag).await.ok_or_else(|| AppError::NotFound(format!("feed for '{tag}'")))?;
+    // Subscribe before reading the cache so no frame falls between the two;
+    // an overlap is harmless because each snapshot carries the seq it is
+    // current through and clients skip deltas at or below it.
     let rx = feed.orderbook_tx.subscribe();
-    Ok(ws.on_upgrade(move |socket| pump(socket, rx, tag, "orderbook")))
+    let snapshots: Vec<String> = {
+        let books = feed.books.read().await;
+        books.iter().map(|(ticker, book)| book.snapshot_frame(ticker)).collect()
+    };
+    Ok(ws.on_upgrade(move |socket| pump(socket, rx, snapshots, tag, "orderbook")))
 }
 
-async fn pump(mut socket: WebSocket, mut rx: broadcast::Receiver<Arc<str>>, tag: String, kind: &'static str) {
-    tracing::debug!(%tag, kind, "proxy client connected");
+async fn pump(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<Arc<str>>,
+    preamble: Vec<String>,
+    tag: String,
+    kind: &'static str,
+) {
+    tracing::debug!(%tag, kind, replayed = preamble.len(), "proxy client connected");
+    for frame in preamble {
+        if socket.send(Message::Text(frame.into())).await.is_err() {
+            return;
+        }
+    }
     loop {
         tokio::select! {
             frame = rx.recv() => match frame {

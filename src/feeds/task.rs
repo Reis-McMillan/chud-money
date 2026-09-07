@@ -21,6 +21,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::FeedShared;
 use crate::db::questdb::{IndexRow, Table};
+use crate::kalshi::book::{OrderBook, OrderbookMsg};
 use crate::kalshi::stream::{
     CfValue5Hz, Envelope, Subscribed, subscribe_index, subscribe_orderbook, update_markets_cmd,
 };
@@ -80,6 +81,8 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>) -> Result<()> {
 
     let (mut ws, _) = connect_async(kalshi.ws_request()?).await.context("websocket handshake failed")?;
     tracing::info!(%tag, url = kalshi.endpoints.ws, "feed connected");
+    // A fresh subscription re-sends snapshots; anything cached is from the old session.
+    shared.books.write().await.clear();
 
     let mut cmd_id = 0u64;
     let mut pending: HashMap<u64, Sub> = HashMap::new();
@@ -89,8 +92,8 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>) -> Result<()> {
     let id = send_cmd(&mut ws, &mut cmd_id, |id| subscribe_index(id, &market.index_id)).await?;
     pending.insert(id, Sub::Ticker);
 
-    let open: BTreeSet<String> =
-        kalshi.open_markets(&market.series_ticker).await?.into_iter().map(|m| m.ticker).collect();
+    let markets = kalshi.open_markets(&market.series_ticker).await?;
+    let open: BTreeSet<String> = markets.iter().map(|m| m.ticker.clone()).collect();
     if !open.is_empty() {
         let id = send_cmd(&mut ws, &mut cmd_id, |id| subscribe_orderbook(id, &open)).await?;
         pending.insert(id, Sub::Orderbook);
@@ -101,6 +104,7 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>) -> Result<()> {
         st.connected = true;
         st.last_error = None;
         st.open_tickers = subscribed.iter().cloned().collect();
+        st.open_markets = markets;
     }
     tracing::info!(%tag, open = subscribed.len(), "subscribed");
 
@@ -130,13 +134,17 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>) -> Result<()> {
             }
 
             _ = refresh.tick() => {
-                let open: BTreeSet<String> = match kalshi.open_markets(&market.series_ticker).await {
-                    Ok(markets) => markets.into_iter().map(|m| m.ticker).collect(),
+                let markets = match kalshi.open_markets(&market.series_ticker).await {
+                    Ok(markets) => markets,
                     Err(e) => {
                         tracing::warn!(%tag, error = %e, "market refresh failed");
                         continue;
                     }
                 };
+                let open: BTreeSet<String> = markets.iter().map(|m| m.ticker.clone()).collect();
+                // Strikes and times can be filled in after a market first
+                // appears, so always publish the latest records.
+                shared.status.write().await.open_markets = markets;
                 let add: Vec<String> = open.difference(&subscribed).cloned().collect();
                 let del: Vec<String> = subscribed.difference(&open).cloned().collect();
                 if add.is_empty() && del.is_empty() {
@@ -160,6 +168,12 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>) -> Result<()> {
                 }
                 subscribed = open;
                 shared.status.write().await.open_tickers = subscribed.iter().cloned().collect();
+                if !del.is_empty() {
+                    let mut books = shared.books.write().await;
+                    for t in &del {
+                        books.remove(t);
+                    }
+                }
             }
 
             _ = ping.tick() => ws.send(Message::Ping(Vec::new().into())).await.context("ping")?,
@@ -218,7 +232,28 @@ async fn handle_text(
             st.last_msg_at = Some(Utc::now());
         }
         "orderbook_snapshot" | "orderbook_delta" => {
+            // Update the cached book and broadcast under the same lock so the
+            // replay a new proxy client receives is ordered with the stream.
+            let mut books = shared.books.write().await;
+            match serde_json::from_value::<OrderbookMsg>(env.msg) {
+                Ok(msg) => {
+                    let is_snapshot = env.typ == "orderbook_snapshot";
+                    match books.get_mut(&msg.market_ticker) {
+                        Some(book) => {
+                            book.apply_msg(&msg, env.seq);
+                        }
+                        None if is_snapshot => {
+                            let mut book = OrderBook::default();
+                            book.apply_msg(&msg, env.seq);
+                            books.insert(msg.market_ticker.clone(), book);
+                        }
+                        None => tracing::debug!(%tag, ticker = %msg.market_ticker, "delta before snapshot; ignored"),
+                    }
+                }
+                Err(e) => tracing::warn!(%tag, error = %e, %text, "bad orderbook frame"),
+            }
             let _ = shared.orderbook_tx.send(Arc::from(text));
+            drop(books);
             shared.status.write().await.orderbook_msgs += 1;
         }
         "subscribed" => {

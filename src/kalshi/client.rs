@@ -1,8 +1,9 @@
 //! Signed REST access to Kalshi, including the CF Benchmarks pass-through.
 
 use anyhow::Context;
-use serde::Deserialize;
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, Request};
@@ -34,14 +35,26 @@ pub struct KalshiClient {
 }
 
 /// One open market inside a series, as returned by `GET /trade-api/v2/markets`.
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // title/close_time are parsed for logging and future use
+/// Exposed verbatim in `FeedStatus::open_markets` so clients can show the
+/// settlement target (`floor_strike`, e.g. the 60s BRTI average before
+/// `open_time` for KXBTC15M) alongside the live index.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OpenMarket {
     pub ticker: String,
     #[serde(default)]
     pub title: String,
     #[serde(default)]
+    pub open_time: String,
+    #[serde(default)]
     pub close_time: String,
+    #[serde(default)]
+    pub strike_type: Option<String>,
+    #[serde(default)]
+    pub floor_strike: Option<f64>,
+    #[serde(default)]
+    pub cap_strike: Option<f64>,
+    #[serde(default)]
+    pub yes_sub_title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,12 +71,16 @@ pub struct HistoryValue {
 }
 
 impl HistoryValue {
-    /// Lenient parse: `time` may be an integer or numeric string (ms), `value`
-    /// may be a number or a decimal string. Returns `None` if either is missing.
+    /// Lenient parse: `time` may be an integer or numeric string (ms) or an
+    /// ISO instant; `value` may be a number or a decimal string. Returns
+    /// `None` if either is missing.
     fn from_value(v: &Value) -> Option<Self> {
         let time_ms = match v.get("time")? {
             Value::Number(n) => n.as_i64()?,
-            Value::String(s) => s.parse().ok()?,
+            Value::String(s) => match s.parse::<i64>() {
+                Ok(ms) => ms,
+                Err(_) => DateTime::parse_from_rfc3339(s).ok()?.timestamp_millis(),
+            },
             _ => return None,
         };
         let value = match v.get("value")? {
@@ -131,21 +148,25 @@ impl KalshiClient {
 
     /// Historical index values via the CF Benchmarks pass-through.
     ///
-    /// `timestamp_ms` must be truncated to the `timespan` granularity (the
-    /// upstream API rejects unaligned starts). Returns the parsed values plus
-    /// the raw upstream payload so callers can log its shape.
+    /// `timestamp_ms` must be the start of a `timespan` period (the upstream
+    /// API rejects unaligned starts) and is sent as an ISO instant, the only
+    /// format it accepts. Returns the parsed values plus the raw upstream
+    /// payload so callers can log its shape.
     pub async fn cf_history_values(
         &self,
         index_id: &str,
         timestamp_ms: i64,
         timespan: &str,
     ) -> Result<(Vec<HistoryValue>, Value), KalshiError> {
+        let timestamp = DateTime::<Utc>::from_timestamp_millis(timestamp_ms)
+            .ok_or_else(|| KalshiError::Parse(format!("timestamp {timestamp_ms} out of range")))?
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
         let resp: Value = self
             .signed_get(
                 CF_HISTORY_PATH,
                 &[
                     ("id", index_id.to_string()),
-                    ("timestamp", timestamp_ms.to_string()),
+                    ("timestamp", timestamp),
                     ("timespan", timespan.to_string()),
                 ],
             )

@@ -10,6 +10,8 @@ use serde::Serialize;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 
+use crate::kalshi::book::OrderBook;
+use crate::kalshi::client::OpenMarket;
 use crate::model::market::Market;
 use crate::state::AppState;
 
@@ -21,6 +23,8 @@ pub struct FeedStatus {
     pub connected: bool,
     pub reconnects: u32,
     pub open_tickers: Vec<String>,
+    /// Full Kalshi market records for `open_tickers`, refreshed every poll.
+    pub open_markets: Vec<OpenMarket>,
     pub last_value: Option<f64>,
     pub last_msg_at: Option<DateTime<Utc>>,
     pub ticker_msgs: u64,
@@ -35,6 +39,9 @@ pub struct FeedShared {
     pub ticker_tx: broadcast::Sender<Arc<str>>,
     /// Raw `orderbook_snapshot` / `orderbook_delta` envelopes.
     pub orderbook_tx: broadcast::Sender<Arc<str>>,
+    /// Current book per market ticker, rebuilt from the frames above so a
+    /// proxy client that connects mid-session can be handed a snapshot.
+    pub books: RwLock<HashMap<String, OrderBook>>,
     pub status: RwLock<FeedStatus>,
 }
 
@@ -80,6 +87,7 @@ impl FeedRegistry {
             market,
             ticker_tx,
             orderbook_tx,
+            books: RwLock::new(HashMap::new()),
             status: RwLock::new(FeedStatus::default()),
         });
         let task = tokio::spawn(task::run_feed(state.clone(), shared.clone()));
