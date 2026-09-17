@@ -2,6 +2,8 @@
 
 use std::sync::Arc;
 
+use verys_rs_client::VerysClient;
+
 use crate::config::Config;
 use crate::controllers::ingest::IngestJobs;
 use crate::db::mongo::Mongo;
@@ -17,4 +19,6 @@ pub struct AppState {
     pub kalshi: Arc<KalshiClient>,
     pub feeds: FeedRegistry,
     pub ingest_jobs: IngestJobs,
+    /// Used only to fetch and cache the Verys signing key (JWKS).
+    pub verys_client: Arc<VerysClient>,
 }

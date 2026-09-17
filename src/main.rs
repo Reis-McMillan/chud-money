@@ -12,6 +12,7 @@ mod db;
 mod error;
 mod feeds;
 mod kalshi;
+mod middleware;
 mod model;
 mod state;
 
@@ -19,6 +20,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
+use verys_rs_client::{Config as VerysConfig, VerysClient};
 
 use crate::config::Config;
 use crate::db::mongo::Mongo;
@@ -31,6 +33,13 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // See the `rustls` entry in Cargo.toml: two crypto backends are linked, so
+    // one must be selected before the first TLS handshake (Kalshi, Verys,
+    // MongoDB) or that task panics. aws-lc-rs is what jsonwebtoken uses.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a rustls crypto provider was already installed"))?;
+
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
@@ -43,6 +52,20 @@ async fn main() -> Result<()> {
     let auth = Auth::new(config.kalshi_key_id.clone(), &pem)?;
     let kalshi = Arc::new(KalshiClient::new(config.kalshi_env.endpoints(), auth));
     tracing::info!(env = config.kalshi_env.as_str(), key = kalshi.key_id(), "kalshi client ready");
+    // JWKS only: the SPA runs the login, so no callback host, secret or scopes.
+    let verys_client = Arc::new(VerysClient::new(VerysConfig::new(
+        "",
+        config.auth_url.clone(),
+        config.client_id.clone(),
+        None,
+        Vec::<String>::new(),
+    )));
+    tracing::info!(
+        auth_url = %config.auth_url,
+        issuer = %config.verys_issuer,
+        audience = %config.client_id,
+        "verys client ready"
+    );
 
     let mongo = Mongo::connect(&config.mongo_uri, &config.mongo_db).await?;
     mongo.ensure_indexes(&[Market::spec()]).await?;
@@ -56,6 +79,7 @@ async fn main() -> Result<()> {
         kalshi,
         feeds: Default::default(),
         ingest_jobs: Default::default(),
+        verys_client,
     };
 
     let markets = Market::all(&state.mongo).await?;

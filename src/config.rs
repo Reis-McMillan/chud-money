@@ -45,7 +45,15 @@ impl KalshiEnv {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Base URL of the Verys auth service, e.g. `https://api.verys.mcmlln.dev`.
+    /// The signing key is fetched from `{auth_url}/.well-known/jwks.json`.
+    pub auth_url: String,
+    /// Expected `iss` of Verys access tokens. Defaults to `auth_url`.
+    pub verys_issuer: String,
     pub bind_addr: String,
+    /// This API's Verys client id: the `audience` the SPA exchanges its
+    /// session for, and therefore the expected `aud` of every access token.
+    pub client_id: String,
     /// Base used to compose the proxy websocket URLs stored in market documents,
     /// e.g. `ws://localhost:3000`.
     pub public_ws_base: String,
@@ -77,8 +85,15 @@ impl Config {
         let pg_password = var_or("QUESTDB_PG_PASSWORD", "quest");
         let pg_db = var_or("QUESTDB_PG_DB", "qdb");
 
+        let auth_url = var_or("AUTH_URL", "http://localhost:8081").trim_end_matches('/').to_string();
+        let verys_issuer = var_or("VERYS_ISSUER", &auth_url).trim_end_matches('/').to_string();
+
         Ok(Self {
+            auth_url,
+            verys_issuer,
             bind_addr: var_or("BIND_ADDR", "0.0.0.0:3000"),
+            client_id: std::env::var("CHUD_MONEY_API_CLIENT_ID")
+                .context("set CHUD_MONEY_API_CLIENT_ID to this API's Verys client id")?,
             public_ws_base: var_or("PUBLIC_WS_BASE", "ws://localhost:3000")
                 .trim_end_matches('/')
                 .to_string(),

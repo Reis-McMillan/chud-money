@@ -11,7 +11,7 @@ use crate::config::{Config, KalshiEnv};
 use crate::kalshi::stream::{CHANNEL_CF_5HZ, CHANNEL_ORDERBOOK};
 
 /// Path segments that would collide with fixed routes if used as a tag.
-pub const RESERVED_TAGS: &[&str] = &["add", "ingest", "ws"];
+pub const RESERVED_TAGS: &[&str] = &["add", "auth", "ingest", "ws"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
@@ -137,7 +137,10 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            auth_url: String::new(),
+            verys_issuer: String::new(),
             bind_addr: "0.0.0.0:3000".into(),
+            client_id: String::new(),
             public_ws_base: "ws://localhost:3000".into(),
             mongo_uri: String::new(),
             mongo_db: String::new(),
