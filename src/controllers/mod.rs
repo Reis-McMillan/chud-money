@@ -1,6 +1,7 @@
 //! HTTP + websocket controllers. Routes:
 //!
 //! - `GET  /`                    list markets (+ feed status)
+//! - `GET  /healthz`             liveness/readiness probe (touches no dependency)
 //! - `GET  /auth/me`             🔒 the caller's identity
 //! - `POST /add`                 🔒 create a market and start its feed
 //! - `POST /ingest`              🔒 start a historical backfill job
@@ -27,6 +28,13 @@ use tower_http::trace::TraceLayer;
 use crate::middleware::authenticated::authenticated;
 use crate::state::AppState;
 
+/// Probe target for Kubernetes. Deliberately touches neither Mongo nor
+/// QuestDB: startup already fails fast when they are down, and a transient
+/// outage after that should not get the pod killed and its feeds restarted.
+async fn healthz() -> &'static str {
+    "ok"
+}
+
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/auth/me", get(auth::me))
@@ -39,6 +47,7 @@ pub fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(markets::list))
+        .route("/healthz", get(healthz))
         .route("/ingest/{job_id}", get(ingest::status))
         .route("/{tag}", get(markets::show))
         .merge(protected)
@@ -88,5 +97,19 @@ mod tests {
         assert_eq!(call(Method::POST, "/add").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/ws/btc-15m/ticker").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/").await, StatusCode::OK);
+    }
+
+    /// `/healthz` sits next to the `/{tag}` capture; axum prefers the static
+    /// match, so the probe must never turn into a market lookup.
+    #[tokio::test]
+    async fn healthz_is_not_captured_by_tag_route() {
+        let app: Router = Router::new().route("/healthz", get(super::healthz)).route("/{tag}", get(ok));
+        let res = app
+            .oneshot(Request::builder().method(Method::GET).uri("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 16).await.unwrap();
+        assert_eq!(&body[..], b"ok");
     }
 }

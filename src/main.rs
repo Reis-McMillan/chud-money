@@ -92,10 +92,38 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "listening");
     axum::serve(listener, controllers::router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Resolves on SIGINT (ctrl-c) or SIGTERM. Kubernetes sends SIGTERM when a
+/// pod is replaced; without handling it the process would sit out the grace
+/// period and then be SIGKILLed mid-flush.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(err) => {
+                tracing::warn!(%err, "cannot listen for SIGTERM; only ctrl-c will stop the server");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutting down");
 }
