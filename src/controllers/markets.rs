@@ -7,7 +7,7 @@ use mongodb::bson::doc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::db::questdb::{Table, TableSummary};
+use crate::db::questdb::{CandleSummary, Table, TableSummary};
 use crate::error::AppError;
 use crate::feeds::FeedStatus;
 use crate::model::Model;
@@ -68,9 +68,10 @@ pub struct MarketDetail {
 pub struct QuestdbSummary {
     pub live: TableSummary,
     pub hist: TableSummary,
+    pub contracts: CandleSummary,
 }
 
-/// `GET /{tag}` — the document plus what QuestDB holds for its index.
+/// `GET /{tag}` — the document plus what QuestDB holds for its index and contracts.
 pub async fn show(
     Path(tag): Path<String>,
     State(state): State<AppState>,
@@ -79,11 +80,12 @@ pub async fn show(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("market '{tag}'")))?;
     let feed = state.feeds.status(&tag).await;
-    let (live, hist) = tokio::try_join!(
+    let (live, hist, contracts) = tokio::try_join!(
         state.questdb.summary(Table::Live, &market.index_id),
         state.questdb.summary(Table::Hist, &market.index_id),
+        state.questdb.candle_summary(&market.series_ticker),
     )?;
-    Ok(Json(MarketDetail { market, feed, questdb: QuestdbSummary { live, hist } }))
+    Ok(Json(MarketDetail { market, feed, questdb: QuestdbSummary { live, hist, contracts } }))
 }
 
 /// `DELETE /{tag}` — stop the feed and remove the document. QuestDB rows are kept.

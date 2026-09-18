@@ -4,6 +4,10 @@
 //! sources: `index_values_live` (5Hz websocket) and `index_values_hist`
 //! (REST pass-through backfill). Both are DEDUP'd on `(ts, index_id)` so
 //! re-ingesting a window or overlapping after a reconnect is idempotent.
+//!
+//! `contract_candles_hist` holds the prices the contracts themselves traded
+//! at: one row per market ticker per candlestick period, DEDUP'd on
+//! `(ts, ticker)`.
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
@@ -44,6 +48,66 @@ pub struct IndexRow {
     pub source: &'static str,
 }
 
+pub const CANDLES_TABLE: &str = "contract_candles_hist";
+
+/// Open/high/low/close of one quantity over a candlestick period, in dollars.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Ohlc {
+    pub open: Option<f64>,
+    pub high: Option<f64>,
+    pub low: Option<f64>,
+    pub close: Option<f64>,
+}
+
+/// One candlestick of one market (e.g. `KXBTC15M-26SEP181300-00`).
+#[derive(Debug, Clone)]
+pub struct CandleRow {
+    pub series_ticker: String,
+    pub ticker: String,
+    /// Settlement target of the market, repeated on every row so candles can
+    /// be compared against the index without a second lookup.
+    pub floor_strike: Option<f64>,
+    pub yes_bid: Ohlc,
+    pub yes_ask: Ohlc,
+    /// Trade prices; all `None` for a period without trades.
+    pub price: Ohlc,
+    /// Volume-weighted average trade price.
+    pub price_mean: Option<f64>,
+    pub volume: Option<f64>,
+    pub open_interest: Option<f64>,
+    /// Designated timestamp: the *end* of the period, as Kalshi reports it.
+    pub ts_ms: i64,
+    pub source: &'static str,
+}
+
+/// Anything the ILP writer can persist.
+#[derive(Debug, Clone)]
+pub enum Row {
+    Index(IndexRow),
+    Candle(Box<CandleRow>),
+}
+
+impl From<IndexRow> for Row {
+    fn from(row: IndexRow) -> Self {
+        Row::Index(row)
+    }
+}
+
+impl From<CandleRow> for Row {
+    fn from(row: CandleRow) -> Self {
+        Row::Candle(Box::new(row))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CandleSummary {
+    pub table: &'static str,
+    pub rows: i64,
+    pub markets: i64,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TableSummary {
     pub table: &'static str,
@@ -58,7 +122,7 @@ pub struct TableSummary {
 
 #[derive(Clone)]
 pub struct Questdb {
-    pub ilp: mpsc::Sender<IndexRow>,
+    pub ilp: mpsc::Sender<Row>,
     pg_conninfo: String,
 }
 
@@ -99,6 +163,23 @@ impl Questdb {
             client.batch_execute(&ddl).await.with_context(|| format!("creating {}", table.name()))?;
             tracing::info!(table = table.name(), "ensured questdb table");
         }
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {CANDLES_TABLE} (\
+                ticker SYMBOL CAPACITY 65536 CACHE INDEX, \
+                series_ticker SYMBOL CAPACITY 256 CACHE, \
+                source SYMBOL, \
+                floor_strike DOUBLE, \
+                yes_bid_open DOUBLE, yes_bid_high DOUBLE, yes_bid_low DOUBLE, yes_bid_close DOUBLE, \
+                yes_ask_open DOUBLE, yes_ask_high DOUBLE, yes_ask_low DOUBLE, yes_ask_close DOUBLE, \
+                price_open DOUBLE, price_high DOUBLE, price_low DOUBLE, price_close DOUBLE, \
+                price_mean DOUBLE, \
+                volume DOUBLE, \
+                open_interest DOUBLE, \
+                ts TIMESTAMP\
+             ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, ticker);"
+        );
+        client.batch_execute(&ddl).await.with_context(|| format!("creating {CANDLES_TABLE}"))?;
+        tracing::info!(table = CANDLES_TABLE, "ensured questdb table");
         Ok(())
     }
 
@@ -144,9 +225,74 @@ impl Questdb {
             rows_last_hour: col(6).and_then(|s| s.parse::<f64>().ok()).map(|v| v as i64).unwrap_or(0),
         })
     }
+
+    /// Row count, distinct markets and time span of one series' candles.
+    /// `series_ticker` is schema-validated to `[A-Z0-9]+`; see `summary` for
+    /// why it is inlined.
+    pub async fn candle_summary(&self, series_ticker: &str) -> Result<CandleSummary, tokio_postgres::Error> {
+        let client = self.pg().await?;
+        let series = series_ticker.replace('\'', "''");
+        let sql = format!(
+            "SELECT count() AS rows, \
+                    count_distinct(ticker) AS markets, \
+                    cast(min(ts) AS string) AS first_ts, \
+                    cast(max(ts) AS string) AS last_ts \
+             FROM {CANDLES_TABLE} WHERE series_ticker = '{series}'"
+        );
+        let row = client
+            .simple_query(&sql)
+            .await?
+            .into_iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            });
+        let col = |i: usize| -> Option<String> { row.as_ref().and_then(|r| r.get(i)).map(str::to_string) };
+        Ok(CandleSummary {
+            table: CANDLES_TABLE,
+            rows: col(0).and_then(|s| s.parse().ok()).unwrap_or(0),
+            markets: col(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+            first_ts: col(2),
+            last_ts: col(3),
+        })
+    }
 }
 
-fn push(buf: &mut Buffer, row: &IndexRow) -> questdb::Result<()> {
+fn push(buf: &mut Buffer, row: &Row) -> questdb::Result<()> {
+    match row {
+        Row::Index(row) => push_index(buf, row),
+        Row::Candle(row) => push_candle(buf, row),
+    }
+}
+
+fn push_candle(buf: &mut Buffer, row: &CandleRow) -> questdb::Result<()> {
+    buf.table(CANDLES_TABLE)?
+        .symbol("ticker", row.ticker.as_str())?
+        .symbol("series_ticker", row.series_ticker.as_str())?
+        .symbol("source", row.source)?;
+    // Absent values are left out so the column stays NULL.
+    let mut columns = vec![
+        ("floor_strike", row.floor_strike),
+        ("price_mean", row.price_mean),
+        ("volume", row.volume),
+        ("open_interest", row.open_interest),
+    ];
+    for (names, ohlc) in [
+        (["yes_bid_open", "yes_bid_high", "yes_bid_low", "yes_bid_close"], row.yes_bid),
+        (["yes_ask_open", "yes_ask_high", "yes_ask_low", "yes_ask_close"], row.yes_ask),
+        (["price_open", "price_high", "price_low", "price_close"], row.price),
+    ] {
+        columns.extend(names.into_iter().zip([ohlc.open, ohlc.high, ohlc.low, ohlc.close]));
+    }
+    for (name, value) in columns {
+        if let Some(value) = value {
+            buf.column_f64(name, value)?;
+        }
+    }
+    buf.at(TimestampNanos::new(row.ts_ms * 1_000_000))
+}
+
+fn push_index(buf: &mut Buffer, row: &IndexRow) -> questdb::Result<()> {
     // Symbols must precede regular columns in a row.
     let b = buf
         .table(row.table.name())?
@@ -162,7 +308,7 @@ fn push(buf: &mut Buffer, row: &IndexRow) -> questdb::Result<()> {
 /// Owns the sync `questdb-rs` sender on its own OS thread. Blocks on the
 /// first row, then drains whatever else is queued (up to `ILP_BATCH`) into
 /// one flush, so 5Hz live traffic flushes promptly and bulk ingest batches.
-fn start_ilp_writer(conf: String, mut rx: mpsc::Receiver<IndexRow>) -> Result<()> {
+fn start_ilp_writer(conf: String, mut rx: mpsc::Receiver<Row>) -> Result<()> {
     let mut sender = Sender::from_conf(&conf).context("QUESTDB_ILP_CONF")?;
     let mut buf = sender.new_buffer();
     std::thread::Builder::new()

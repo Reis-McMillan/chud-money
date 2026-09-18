@@ -220,7 +220,7 @@ async fn handle_text(
                     received_at_ms: value.received_at,
                     source: "ws_5hz",
                 };
-                match state.questdb.ilp.try_send(row) {
+                match state.questdb.ilp.try_send(row.into()) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => tracing::warn!(%tag, "ilp queue full; dropping live row"),
                     Err(TrySendError::Closed(_)) => tracing::error!(%tag, "ilp writer gone"),

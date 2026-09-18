@@ -4,7 +4,7 @@
 //! - `GET  /healthz`             liveness/readiness probe (touches no dependency)
 //! - `GET  /auth/me`             🔒 the caller's identity
 //! - `POST /add`                 🔒 create a market and start its feed
-//! - `POST /ingest`              🔒 start a historical backfill job
+//! - `POST /ingest`              🔒 start a historical backfill job (`kind`: `index` or `contracts`)
 //! - `GET  /ingest/{job_id}`     backfill job status
 //! - `GET  /{tag}`               market document + feed status + QuestDB summary
 //! - `DELETE /{tag}`             🔒 stop the feed and delete the document
