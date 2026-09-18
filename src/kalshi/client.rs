@@ -1,5 +1,7 @@
 //! Signed REST access to Kalshi, including the CF Benchmarks pass-through.
 
+use std::time::Duration;
+
 use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::de::DeserializeOwned;
@@ -11,6 +13,14 @@ use tokio_tungstenite::tungstenite::http::{HeaderValue, Request};
 use crate::config::KalshiEndpoints;
 use crate::db::questdb::Ohlc;
 use crate::kalshi::auth::Auth;
+
+/// A request that takes longer than this is abandoned (and retried by the
+/// ingest jobs) rather than left to hang a backfill.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Kalshi drops idle keep-alive connections without notice; reusing one fails
+/// with "connection closed before message completed", so let them go first.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub const WS_PATH: &str = "/trade-api/ws/v2";
 pub const MARKETS_PATH: &str = "/trade-api/v2/markets";
@@ -33,6 +43,18 @@ pub enum KalshiError {
     Transport(#[from] reqwest::Error),
     #[error("unexpected kalshi response: {0}")]
     Parse(String),
+}
+
+impl KalshiError {
+    /// Worth retrying: throttling, network failures and upstream 5xx. A 4xx
+    /// or an unparseable body would fail the same way again.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            KalshiError::RateLimited | KalshiError::Transport(_) => true,
+            KalshiError::Status { status, .. } => *status >= 500,
+            KalshiError::Parse(_) => false,
+        }
+    }
 }
 
 pub struct KalshiClient {
@@ -189,7 +211,13 @@ impl HistoryValue {
 
 impl KalshiClient {
     pub fn new(endpoints: KalshiEndpoints, auth: Auth) -> Self {
-        Self { http: reqwest::Client::new(), endpoints, auth }
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .build()
+            .expect("static reqwest client configuration");
+        Self { http, endpoints, auth }
     }
 
     pub fn key_id(&self) -> &str {

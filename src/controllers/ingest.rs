@@ -7,6 +7,12 @@
 //!   every market of the series that was open during the range, into
 //!   `contract_candles_hist`.
 //!
+//! Before asking Kalshi for anything a job checks what QuestDB already holds
+//! and skips the hour windows / markets that are complete there, so
+//! resubmitting a failed or overlapping request only fetches what is missing
+//! (`force` turns this off). Transient upstream failures are retried with
+//! backoff for up to `RETRY_WINDOW` before the job fails.
+//!
 //! Each pass-through call costs 50 rate-limit tokens (roughly 4 requests per
 //! second on the basic tier) and a contracts backfill makes one request per
 //! market, so a backfill runs as a throttled background job and the endpoint
@@ -14,7 +20,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Path, State};
@@ -37,7 +43,16 @@ const CONTRACT_REQUEST_GAP: Duration = Duration::from_millis(100);
 /// Finest candlestick period Kalshi offers (the others are 60 and 1440).
 const CANDLE_PERIOD_MINUTES: u32 = 1;
 const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5);
-const MAX_RATE_LIMIT_RETRIES: u32 = 5;
+/// Backoff after a network failure or upstream 5xx, doubling up to the max.
+const RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How long one upstream call may keep failing before the job gives up.
+const RETRY_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// CF Benchmarks publishes its real-time indices once per second.
+const INDEX_ROWS_PER_SECOND: i64 = 1;
+/// Share of the expected rows a window needs to count as already ingested.
+/// Full hours upstream are never below 96%; a dropped write loses far more.
+const INDEX_COMPLETE_PERCENT: i64 = 90;
 
 pub type IngestJobs = Arc<RwLock<HashMap<String, IngestJob>>>;
 
@@ -61,6 +76,9 @@ pub struct IngestRequest {
     pub kind: IngestKind,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    /// Fetch everything again, even what QuestDB already holds.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// One CF Benchmarks history window (`HOUR`, `DAY`, `MONTH` or `YEAR`, the
@@ -94,6 +112,16 @@ impl Timespan {
             Self::Day => "DAY",
             Self::Month => "MONTH",
             Self::Year => "YEAR",
+        }
+    }
+
+    /// The same period as a QuestDB `SAMPLE BY` interval.
+    pub fn sample_by(self) -> &'static str {
+        match self {
+            Self::Hour => "1h",
+            Self::Day => "1d",
+            Self::Month => "1M",
+            Self::Year => "1y",
         }
     }
 
@@ -165,7 +193,14 @@ pub struct IngestJob {
     /// `contracts` only: markets found in range, and how many are done.
     pub markets_total: u64,
     pub markets_done: u64,
+    pub force: bool,
     pub requests: u64,
+    /// Hour windows (`index`) or markets (`contracts`) not requested because
+    /// QuestDB already held them.
+    pub skipped: u64,
+    pub retries: u64,
+    /// Why the call in flight is being retried; cleared once it succeeds.
+    pub retry_error: Option<String>,
     pub rows: u64,
     pub error: Option<String>,
     pub started_at: DateTime<Utc>,
@@ -214,6 +249,10 @@ pub async fn start(
         cursor_ms,
         markets_total: 0,
         markets_done: 0,
+        force: req.force,
+        skipped: 0,
+        retries: 0,
+        retry_error: None,
         requests: 0,
         rows: 0,
         error: None,
@@ -271,7 +310,16 @@ async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan) {
     match outcome {
         Ok(()) => {
             job.status = JobStatus::Done;
-            tracing::info!(%job_id, tag = %job.tag, kind = ?job.kind, requests = job.requests, rows = job.rows, "ingest done");
+            tracing::info!(
+                %job_id,
+                tag = %job.tag,
+                kind = ?job.kind,
+                requests = job.requests,
+                skipped = job.skipped,
+                retries = job.retries,
+                rows = job.rows,
+                "ingest done"
+            );
         }
         Err(e) => {
             job.status = JobStatus::Failed;
@@ -282,40 +330,83 @@ async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan) {
     state.ingest_jobs.write().await.insert(job_id, job);
 }
 
-/// Runs one Kalshi call for `job`, backing off and retrying while it is rate
-/// limited, and counts the request once it gets through.
-async fn throttled<T, F>(job: &mut IngestJob, mut call: impl FnMut() -> F) -> anyhow::Result<T>
+async fn publish(state: &AppState, job: &IngestJob) {
+    state.ingest_jobs.write().await.insert(job.job_id.clone(), job.clone());
+}
+
+/// Runs one Kalshi call for `job` and counts it once it gets through.
+/// Transient failures (see `KalshiError::is_transient`) are retried with
+/// backoff until the call has been failing for `RETRY_WINDOW`.
+async fn throttled<T, F>(state: &AppState, job: &mut IngestJob, mut call: impl FnMut() -> F) -> anyhow::Result<T>
 where
     F: Future<Output = Result<T, KalshiError>>,
 {
-    let mut rate_limit_hits = 0u32;
+    let first_attempt = Instant::now();
+    let mut backoff = RETRY_BACKOFF_MIN;
+    let mut attempts = 0u32;
     loop {
-        match call().await {
-            Err(KalshiError::RateLimited) => {
-                rate_limit_hits += 1;
-                anyhow::ensure!(
-                    rate_limit_hits <= MAX_RATE_LIMIT_RETRIES,
-                    "rate limited {rate_limit_hits} times in a row at cursor {}",
-                    job.cursor_ms
-                );
-                tracing::warn!(job_id = %job.job_id, cursor = job.cursor_ms, "rate limited; backing off");
-                tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
-            }
+        let error = match call().await {
+            Err(e) if e.is_transient() => e,
             result => {
                 job.requests += 1;
+                job.retry_error = None;
                 return Ok(result?);
             }
+        };
+        attempts += 1;
+        let delay = match error {
+            KalshiError::RateLimited => RATE_LIMIT_BACKOFF,
+            _ => backoff,
+        };
+        if first_attempt.elapsed() + delay > RETRY_WINDOW {
+            return Err(anyhow::Error::new(error).context(format!(
+                "gave up after {attempts} attempts over {}s at cursor {}",
+                first_attempt.elapsed().as_secs(),
+                job.cursor_ms
+            )));
         }
+        tracing::warn!(job_id = %job.job_id, cursor = job.cursor_ms, attempts, ?delay, %error, "kalshi call failed; retrying");
+        job.retries += 1;
+        job.retry_error = Some(error.to_string());
+        publish(state, job).await;
+        tokio::time::sleep(delay).await;
+        backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
     }
+}
+
+/// Whether QuestDB's `rows` cover the part of the window starting at
+/// `window_ms` that lies inside `[start_ms, end_ms)`. A window still in
+/// progress at `now_ms` never does.
+fn index_window_complete(rows: i64, window_ms: i64, next_ms: i64, start_ms: i64, end_ms: i64, now_ms: i64) -> bool {
+    let seconds = (next_ms.min(end_ms) - window_ms.max(start_ms)) / 1_000;
+    next_ms <= now_ms && seconds > 0 && rows * 100 >= seconds * INDEX_ROWS_PER_SECOND * INDEX_COMPLETE_PERCENT
 }
 
 async fn ingest_loop(state: &AppState, job: &mut IngestJob, timespan: Timespan) -> anyhow::Result<()> {
     let mut logged_sample = false;
+    let existing = if job.force {
+        HashMap::new()
+    } else {
+        let counts = state.questdb.index_counts(&job.index_id, job.start_ms, job.end_ms, timespan.sample_by()).await;
+        counts.unwrap_or_else(|e| {
+            tracing::warn!(job_id = %job.job_id, error = %e, "cannot read existing rows; fetching everything");
+            HashMap::new()
+        })
+    };
 
     while job.cursor_ms < job.end_ms {
+        let next_ms = timespan.next(job.cursor_ms);
+        let rows = existing.get(&job.cursor_ms).copied().unwrap_or(0);
+        if index_window_complete(rows, job.cursor_ms, next_ms, job.start_ms, job.end_ms, Utc::now().timestamp_millis()) {
+            job.skipped += 1;
+            job.cursor_ms = next_ms;
+            publish(state, job).await;
+            continue;
+        }
+
         let (index_id, cursor_ms, span) = (job.index_id.clone(), job.cursor_ms, job.timespan.clone());
         let (values, raw) =
-            throttled(job, || state.kalshi.cf_history_values(&index_id, cursor_ms, &span)).await?;
+            throttled(state, job, || state.kalshi.cf_history_values(&index_id, cursor_ms, &span)).await?;
 
         if !logged_sample {
             logged_sample = true;
@@ -339,8 +430,8 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, timespan: Timespan) 
 
         // Always step to the next aligned period; the upstream rejects
         // unaligned timestamps and QuestDB dedups on (ts, index_id).
-        job.cursor_ms = timespan.next(job.cursor_ms);
-        state.ingest_jobs.write().await.insert(job.job_id.clone(), job.clone());
+        job.cursor_ms = next_ms;
+        publish(state, job).await;
 
         tokio::time::sleep(REQUEST_GAP).await;
     }
@@ -352,6 +443,14 @@ fn overlaps(market: &SeriesMarket, start_ms: i64, end_ms: i64) -> bool {
     market.close_ms > start_ms && market.open_ms < end_ms
 }
 
+/// Whether QuestDB's `candles` cover a market over `[from_ms, to_ms]`: Kalshi
+/// reports one candle per period, trades or not. A market still trading at
+/// `now_ms` never does.
+fn candles_complete(candles: i64, from_ms: i64, to_ms: i64, now_ms: i64) -> bool {
+    let expected = (to_ms - from_ms) / (CANDLE_PERIOD_MINUTES as i64 * 60_000);
+    to_ms <= now_ms && expected > 0 && candles >= expected
+}
+
 /// Every market of the job's series that was open during its range, oldest
 /// first. Markets settled before Kalshi's cutoff are only listed by the
 /// historical endpoint and the rest only by the live one, so a range that
@@ -359,7 +458,7 @@ fn overlaps(market: &SeriesMarket, start_ms: i64, end_ms: i64) -> bool {
 async fn markets_in_range(state: &AppState, job: &mut IngestJob) -> anyhow::Result<Vec<SeriesMarket>> {
     let series = job.series_ticker.clone();
     let (start_ms, end_ms) = (job.start_ms, job.end_ms);
-    let cutoff_ms = throttled(job, || state.kalshi.historical_cutoff()).await?.timestamp_millis();
+    let cutoff_ms = throttled(state, job, || state.kalshi.historical_cutoff()).await?.timestamp_millis();
 
     let mut tiers = Vec::new();
     if start_ms < cutoff_ms {
@@ -373,8 +472,10 @@ async fn markets_in_range(state: &AppState, job: &mut IngestJob) -> anyhow::Resu
     for tier in tiers {
         let mut cursor: Option<String> = None;
         loop {
-            let (page, next) =
-                throttled(job, || state.kalshi.series_markets_page(&series, tier, start_ms, cursor.as_deref())).await?;
+            let (page, next) = throttled(state, job, || {
+                state.kalshi.series_markets_page(&series, tier, start_ms, cursor.as_deref())
+            })
+            .await?;
             // Pages run newest close first and the historical listing cannot
             // be filtered by time, so stop once a page reaches past the start.
             let past_start = page.last().is_none_or(|m| m.close_ms <= start_ms);
@@ -395,21 +496,38 @@ async fn contracts_loop(state: &AppState, job: &mut IngestJob) -> anyhow::Result
     let markets = markets_in_range(state, job).await?;
     job.markets_total = markets.len() as u64;
     tracing::info!(job_id = %job.job_id, series = %job.series_ticker, markets = markets.len(), "markets in range");
-    state.ingest_jobs.write().await.insert(job.job_id.clone(), job.clone());
+    publish(state, job).await;
+
+    let existing = if job.force {
+        HashMap::new()
+    } else {
+        state.questdb.candle_counts(&job.series_ticker, job.start_ms, job.end_ms).await.unwrap_or_else(|e| {
+            tracing::warn!(job_id = %job.job_id, error = %e, "cannot read existing candles; fetching everything");
+            HashMap::new()
+        })
+    };
 
     let series = job.series_ticker.clone();
     for market in markets {
         let from_ms = market.open_ms.max(job.start_ms);
         let to_ms = market.close_ms.min(job.end_ms);
+        let candles = existing.get(&market.ticker).copied().unwrap_or(0);
+        if candles_complete(candles, from_ms, to_ms, Utc::now().timestamp_millis()) {
+            job.skipped += 1;
+            job.markets_done += 1;
+            job.cursor_ms = job.cursor_ms.max(to_ms);
+            publish(state, job).await;
+            continue;
+        }
         let fetch = |tier: Tier| {
             state.kalshi.market_candlesticks(&series, &market.ticker, tier, from_ms, to_ms, CANDLE_PERIOD_MINUTES)
         };
-        let candles = match throttled(job, || fetch(market.tier)).await {
+        let candles = match throttled(state, job, || fetch(market.tier)).await {
             Ok(candles) => candles,
             // Kalshi archives markets some time after the cutoff moves, so one
             // that settled near it can still sit in the tier that did not list it.
             Err(e) if matches!(e.downcast_ref(), Some(KalshiError::Status { status: 404, .. })) => {
-                throttled(job, || fetch(market.tier.other())).await?
+                throttled(state, job, || fetch(market.tier.other())).await?
             }
             Err(e) => return Err(e),
         };
@@ -434,7 +552,7 @@ async fn contracts_loop(state: &AppState, job: &mut IngestJob) -> anyhow::Result
 
         job.markets_done += 1;
         job.cursor_ms = job.cursor_ms.max(to_ms);
-        state.ingest_jobs.write().await.insert(job.job_id.clone(), job.clone());
+        publish(state, job).await;
 
         tokio::time::sleep(CONTRACT_REQUEST_GAP).await;
     }
@@ -444,7 +562,7 @@ async fn contracts_loop(state: &AppState, job: &mut IngestJob) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    use super::{IngestKind, IngestRequest, Timespan, overlaps};
+    use super::{IngestKind, IngestRequest, Timespan, candles_complete, index_window_complete, overlaps};
     use crate::kalshi::client::{SeriesMarket, Tier};
 
     #[test]
@@ -455,6 +573,35 @@ mod tests {
         let body = body.replace("{", r#"{"kind":"contracts","#);
         let req: IngestRequest = serde_json::from_str(&body).unwrap();
         assert_eq!(req.kind, IngestKind::Contracts);
+    }
+
+    #[test]
+    fn complete_index_windows_are_skipped() {
+        const HOUR: i64 = 3_600_000;
+        let now = 100 * HOUR;
+        // Upstream gaps leave full hours a little short of 3600 rows.
+        assert!(index_window_complete(3_600, 0, HOUR, 0, 10 * HOUR, now));
+        assert!(index_window_complete(3_459, 0, HOUR, 0, 10 * HOUR, now));
+        assert!(!index_window_complete(1_800, 0, HOUR, 0, 10 * HOUR, now));
+        assert!(!index_window_complete(0, 0, HOUR, 0, 10 * HOUR, now));
+        // Only the part of the window inside the range is expected.
+        assert!(index_window_complete(372, 0, HOUR, HOUR - 372_000, 10 * HOUR, now));
+        assert!(index_window_complete(600, HOUR, 2 * HOUR, 0, HOUR + 600_000, now));
+        // The hour in progress keeps growing.
+        assert!(!index_window_complete(3_600, 0, HOUR, 0, 10 * HOUR, HOUR - 1));
+    }
+
+    #[test]
+    fn complete_markets_are_skipped() {
+        const MINUTE: i64 = 60_000;
+        let now = 1_000 * MINUTE;
+        assert!(candles_complete(15, 0, 15 * MINUTE, now));
+        assert!(!candles_complete(14, 0, 15 * MINUTE, now));
+        assert!(!candles_complete(0, 0, 15 * MINUTE, now));
+        // Clipped by the range: only the minutes inside it are expected.
+        assert!(candles_complete(5, 10 * MINUTE, 15 * MINUTE, now));
+        // Still trading.
+        assert!(!candles_complete(15, 0, 15 * MINUTE, 15 * MINUTE - 1));
     }
 
     #[test]

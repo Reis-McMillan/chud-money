@@ -9,7 +9,10 @@
 //! at: one row per market ticker per candlestick period, DEDUP'd on
 //! `(ts, ticker)`.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
+use chrono::{DateTime, SecondsFormat, Utc};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use serde::Serialize;
 use tokio::sync::mpsc;
@@ -226,6 +229,57 @@ impl Questdb {
         })
     }
 
+    /// Rows `index_values_hist` already holds for one index within
+    /// `[start_ms, end_ms)`, counted per calendar-aligned `sample_by` bucket
+    /// (a QuestDB interval such as `1h`) and keyed by bucket start in ms.
+    /// See `summary` for why the id is inlined.
+    pub async fn index_counts(
+        &self,
+        index_id: &str,
+        start_ms: i64,
+        end_ms: i64,
+        sample_by: &str,
+    ) -> Result<HashMap<i64, i64>, tokio_postgres::Error> {
+        let client = self.pg().await?;
+        let id = index_id.replace('\'', "''");
+        let sql = format!(
+            "SELECT cast(ts AS long) AS bucket_us, count() AS rows \
+             FROM {} WHERE index_id = '{id}' AND ts >= '{}' AND ts < '{}' \
+             SAMPLE BY {sample_by} ALIGN TO CALENDAR",
+            Table::Hist.name(),
+            ts_literal(start_ms),
+            ts_literal(end_ms),
+        );
+        let counts = client.simple_query(&sql).await?.into_iter().filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some((r.get(0)?.parse::<i64>().ok()? / 1_000, r.get(1)?.parse().ok()?)),
+            _ => None,
+        });
+        Ok(counts.collect())
+    }
+
+    /// Candles `contract_candles_hist` already holds per market ticker of one
+    /// series, for periods ending within `[start_ms, end_ms]`.
+    pub async fn candle_counts(
+        &self,
+        series_ticker: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<String, i64>, tokio_postgres::Error> {
+        let client = self.pg().await?;
+        let series = series_ticker.replace('\'', "''");
+        let sql = format!(
+            "SELECT ticker, count() AS rows \
+             FROM {CANDLES_TABLE} WHERE series_ticker = '{series}' AND ts >= '{}' AND ts <= '{}'",
+            ts_literal(start_ms),
+            ts_literal(end_ms),
+        );
+        let counts = client.simple_query(&sql).await?.into_iter().filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some((r.get(0)?.to_string(), r.get(1)?.parse().ok()?)),
+            _ => None,
+        });
+        Ok(counts.collect())
+    }
+
     /// Row count, distinct markets and time span of one series' candles.
     /// `series_ticker` is schema-validated to `[A-Z0-9]+`; see `summary` for
     /// why it is inlined.
@@ -256,6 +310,11 @@ impl Questdb {
             last_ts: col(3),
         })
     }
+}
+
+/// `ms` as a timestamp literal QuestDB compares against `ts`.
+fn ts_literal(ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or_default().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
 fn push(buf: &mut Buffer, row: &Row) -> questdb::Result<()> {
