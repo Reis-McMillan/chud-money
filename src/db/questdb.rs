@@ -7,7 +7,8 @@
 //!
 //! `contract_candles_hist` holds the prices the contracts themselves traded
 //! at: one row per market ticker per candlestick period, DEDUP'd on
-//! `(ts, ticker)`.
+//! `(ts, ticker)`. `coinbase_candles_hist` holds Coinbase spot candles, one
+//! row per product per minute, DEDUP'd on `(ts, product)`.
 
 use std::collections::HashMap;
 
@@ -83,16 +84,41 @@ pub struct CandleRow {
     pub source: &'static str,
 }
 
+pub const COINBASE_TABLE: &str = "coinbase_candles_hist";
+
+/// One Coinbase spot candle of one product (e.g. `BTC-USD`).
+#[derive(Debug, Clone)]
+pub struct CoinbaseRow {
+    pub product: String,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    /// In base currency.
+    pub volume: f64,
+    /// Designated timestamp: the *start* of the period, as Coinbase reports
+    /// it (Kalshi's candles use the end).
+    pub ts_ms: i64,
+    pub source: &'static str,
+}
+
 /// Anything the ILP writer can persist.
 #[derive(Debug, Clone)]
 pub enum Row {
     Index(IndexRow),
+    Coinbase(CoinbaseRow),
     Candle(Box<CandleRow>),
 }
 
 impl From<IndexRow> for Row {
     fn from(row: IndexRow) -> Self {
         Row::Index(row)
+    }
+}
+
+impl From<CoinbaseRow> for Row {
+    fn from(row: CoinbaseRow) -> Self {
+        Row::Coinbase(row)
     }
 }
 
@@ -109,6 +135,16 @@ pub struct CandleSummary {
     pub markets: i64,
     pub first_ts: Option<String>,
     pub last_ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CoinbaseSummary {
+    pub table: &'static str,
+    pub product: String,
+    pub rows: i64,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+    pub last_close: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +219,17 @@ impl Questdb {
         );
         client.batch_execute(&ddl).await.with_context(|| format!("creating {CANDLES_TABLE}"))?;
         tracing::info!(table = CANDLES_TABLE, "ensured questdb table");
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {COINBASE_TABLE} (\
+                product SYMBOL CAPACITY 256 CACHE INDEX, \
+                source SYMBOL, \
+                open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE, \
+                volume DOUBLE, \
+                ts TIMESTAMP\
+             ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, product);"
+        );
+        client.batch_execute(&ddl).await.with_context(|| format!("creating {COINBASE_TABLE}"))?;
+        tracing::info!(table = COINBASE_TABLE, "ensured questdb table");
         Ok(())
     }
 
@@ -257,6 +304,61 @@ impl Questdb {
         Ok(counts.collect())
     }
 
+    /// Candles `coinbase_candles_hist` already holds for one product within
+    /// `[start_ms, end_ms)`, per calendar hour, keyed by hour start in ms.
+    /// `product` is pattern-validated; see `summary` for why it is inlined.
+    pub async fn coinbase_counts(
+        &self,
+        product: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<HashMap<i64, i64>, tokio_postgres::Error> {
+        let client = self.pg().await?;
+        let product = product.replace('\'', "''");
+        let sql = format!(
+            "SELECT cast(ts AS long) AS bucket_us, count() AS rows \
+             FROM {COINBASE_TABLE} WHERE product = '{product}' AND ts >= '{}' AND ts < '{}' \
+             SAMPLE BY 1h ALIGN TO CALENDAR",
+            ts_literal(start_ms),
+            ts_literal(end_ms),
+        );
+        let counts = client.simple_query(&sql).await?.into_iter().filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some((r.get(0)?.parse::<i64>().ok()? / 1_000, r.get(1)?.parse().ok()?)),
+            _ => None,
+        });
+        Ok(counts.collect())
+    }
+
+    /// Row count, time span and latest close of one product's candles.
+    pub async fn coinbase_summary(&self, product: &str) -> Result<CoinbaseSummary, tokio_postgres::Error> {
+        let client = self.pg().await?;
+        let escaped = product.replace('\'', "''");
+        let sql = format!(
+            "SELECT count() AS rows, \
+                    cast(min(ts) AS string) AS first_ts, \
+                    cast(max(ts) AS string) AS last_ts, \
+                    last(close) AS last_close \
+             FROM {COINBASE_TABLE} WHERE product = '{escaped}'"
+        );
+        let row = client
+            .simple_query(&sql)
+            .await?
+            .into_iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some(r),
+                _ => None,
+            });
+        let col = |i: usize| -> Option<String> { row.as_ref().and_then(|r| r.get(i)).map(str::to_string) };
+        Ok(CoinbaseSummary {
+            table: COINBASE_TABLE,
+            product: product.to_string(),
+            rows: col(0).and_then(|s| s.parse().ok()).unwrap_or(0),
+            first_ts: col(1),
+            last_ts: col(2),
+            last_close: col(3).and_then(|s| s.parse().ok()),
+        })
+    }
+
     /// Candles `contract_candles_hist` already holds per market ticker of one
     /// series, for periods ending within `[start_ms, end_ms]`.
     pub async fn candle_counts(
@@ -321,7 +423,20 @@ fn push(buf: &mut Buffer, row: &Row) -> questdb::Result<()> {
     match row {
         Row::Index(row) => push_index(buf, row),
         Row::Candle(row) => push_candle(buf, row),
+        Row::Coinbase(row) => push_coinbase(buf, row),
     }
+}
+
+fn push_coinbase(buf: &mut Buffer, row: &CoinbaseRow) -> questdb::Result<()> {
+    buf.table(COINBASE_TABLE)?
+        .symbol("product", row.product.as_str())?
+        .symbol("source", row.source)?
+        .column_f64("open", row.open)?
+        .column_f64("high", row.high)?
+        .column_f64("low", row.low)?
+        .column_f64("close", row.close)?
+        .column_f64("volume", row.volume)?;
+    buf.at(TimestampNanos::new(row.ts_ms * 1_000_000))
 }
 
 fn push_candle(buf: &mut Buffer, row: &CandleRow) -> questdb::Result<()> {

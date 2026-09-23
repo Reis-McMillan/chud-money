@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use verys_rs_client::VerysClient;
 
+use crate::coinbase::client::CoinbaseClient;
 use crate::config::Config;
 use crate::controllers::ingest::IngestJobs;
 use crate::db::mongo::Mongo;
@@ -17,6 +18,8 @@ pub struct AppState {
     pub mongo: Mongo,
     pub questdb: Questdb,
     pub kalshi: Arc<KalshiClient>,
+    /// `None` when no CDP API key is configured.
+    pub coinbase: Option<Arc<CoinbaseClient>>,
     pub feeds: FeedRegistry,
     pub ingest_jobs: IngestJobs,
     /// Used only to fetch and cache the Verys signing key (JWKS).

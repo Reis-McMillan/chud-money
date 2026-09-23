@@ -13,6 +13,15 @@ use crate::kalshi::stream::{CHANNEL_CF_5HZ, CHANNEL_ORDERBOOK};
 /// Path segments that would collide with fixed routes if used as a tag.
 pub const RESERVED_TAGS: &[&str] = &["add", "auth", "ingest", "ws"];
 
+/// Coinbase product ids are `BASE-QUOTE`, e.g. `BTC-USD`.
+pub const COINBASE_PRODUCT_PATTERN: &str = "^[A-Z0-9]+-[A-Z0-9]+$";
+
+/// `COINBASE_PRODUCT_PATTERN`, for values that never pass through the schema.
+pub fn valid_coinbase_product(product: &str) -> bool {
+    let part = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    product.split_once('-').is_some_and(|(base, quote)| part(base) && part(quote))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     /// URL-safe identity, e.g. `btc-15m`.
@@ -22,6 +31,9 @@ pub struct Market {
     pub series_ticker: String,
     /// CF Benchmarks index the series settles on, e.g. `BRTI`.
     pub index_id: String,
+    /// Coinbase spot product whose candles augment the index, e.g. `BTC-USD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coinbase_product: Option<String>,
     pub title: String,
     pub kalshi: KalshiInfo,
     pub proxy: ProxyInfo,
@@ -50,6 +62,8 @@ pub struct AddMarket {
     pub series_ticker: String,
     pub index_id: String,
     #[serde(default)]
+    pub coinbase_product: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub kalshi_env: Option<KalshiEnv>,
@@ -75,6 +89,7 @@ impl Market {
             tag: input.tag,
             series_ticker: input.series_ticker,
             index_id: input.index_id,
+            coinbase_product: input.coinbase_product,
             created_at: Utc::now().to_rfc3339(),
         }
     }
@@ -98,6 +113,7 @@ pub static MARKET_SPEC: LazyLock<ModelSpec> = LazyLock::new(|| {
                 },
                 "series_ticker": { "type": "string", "pattern": "^[A-Z0-9]+$" },
                 "index_id": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+                "coinbase_product": { "type": "string", "pattern": COINBASE_PRODUCT_PATTERN },
                 "title": { "type": "string", "minLength": 1, "maxLength": 200 },
                 "kalshi": {
                     "type": "object",
@@ -149,6 +165,7 @@ mod tests {
             kalshi_env: KalshiEnv::Prod,
             kalshi_key_id: String::new(),
             kalshi_key_path: String::new(),
+            cdp_key: None,
         }
     }
 
@@ -157,6 +174,7 @@ mod tests {
             tag: tag.into(),
             series_ticker: "KXBTC15M".into(),
             index_id: "BRTI".into(),
+            coinbase_product: None,
             title: None,
             kalshi_env: None,
         }
@@ -169,6 +187,28 @@ mod tests {
         MARKET_SPEC.validate(&v).unwrap();
         assert_eq!(m.proxy.ticker_ws, "ws://localhost:3000/ws/btc-15m/ticker");
         assert_eq!(MARKET_SPEC.identity_filter(&v).unwrap().get_str("tag").unwrap(), "btc-15m");
+    }
+
+    #[test]
+    fn coinbase_product_is_optional_and_validated() {
+        let mut input = add("btc-15m");
+        input.coinbase_product = Some("BTC-USD".into());
+        let v = serde_json::to_value(Market::from_add(input, &test_config())).unwrap();
+        MARKET_SPEC.validate(&v).unwrap();
+        assert_eq!(v["coinbase_product"], "BTC-USD");
+
+        // Documents stored before the field existed have no key at all.
+        let v = serde_json::to_value(Market::from_add(add("btc-15m"), &test_config())).unwrap();
+        assert!(v.get("coinbase_product").is_none());
+
+        assert!(valid_coinbase_product("BTC-USD"));
+        assert!(!valid_coinbase_product("BTC-USD-PERP") && !valid_coinbase_product("BTCUSD"));
+        assert!(!valid_coinbase_product("-USD") && !valid_coinbase_product("btc-usd"));
+
+        let mut input = add("btc-15m");
+        input.coinbase_product = Some("btc/usd".into());
+        let v = serde_json::to_value(Market::from_add(input, &test_config())).unwrap();
+        assert!(MARKET_SPEC.validate(&v).is_err());
     }
 
     #[test]

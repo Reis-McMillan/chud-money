@@ -66,6 +66,9 @@ pub struct Config {
     pub kalshi_env: KalshiEnv,
     pub kalshi_key_id: String,
     pub kalshi_key_path: String,
+    /// Coinbase (CDP) API key: id and base64 Ed25519 private key. Coinbase
+    /// ingests are refused unless both are set.
+    pub cdp_key: Option<(String, String)>,
 }
 
 fn var_or(name: &str, default: &str) -> String {
@@ -88,6 +91,18 @@ impl Config {
         let auth_url = var_or("AUTH_URL", "http://localhost:8081").trim_end_matches('/').to_string();
         let verys_issuer = var_or("VERYS_ISSUER", &auth_url).trim_end_matches('/').to_string();
 
+        let non_empty = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        let cdp_key = match (non_empty("CDP_API_KEY_ID"), non_empty("CDP_API_KEY_SECRET")) {
+            (Some(id), Some(secret)) => Some((id, secret)),
+            (None, None) => None,
+            // Not fatal: everything but the coinbase ingest works without it.
+            (id, _) => {
+                let missing = if id.is_some() { "CDP_API_KEY_SECRET" } else { "CDP_API_KEY_ID" };
+                tracing::warn!("{missing} is not set; coinbase ingest is disabled");
+                None
+            }
+        };
+
         Ok(Self {
             auth_url,
             verys_issuer,
@@ -107,6 +122,7 @@ impl Config {
             kalshi_key_id: std::env::var("KALSHI_API_KEY_ID")
                 .context("set KALSHI_API_KEY_ID to your Kalshi API key id")?,
             kalshi_key_path: var_or("KALSHI_PRIVATE_KEY_PATH", "kalshi_key.pem"),
+            cdp_key,
         })
     }
 }

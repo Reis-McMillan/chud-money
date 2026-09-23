@@ -6,9 +6,11 @@
 //!   candlesticks (yes bid/ask and trade OHLC, volume, open interest) of
 //!   every market of the series that was open during the range, into
 //!   `contract_candles_hist`.
+//! - `coinbase`: 1-minute spot candles of the market's Coinbase product (or
+//!   the request's `product`), into `coinbase_candles_hist`.
 //!
 //! Before asking Kalshi for anything a job checks what QuestDB already holds
-//! and skips the hour windows / markets that are complete there, so
+//! and skips the windows / markets that are complete there, so
 //! resubmitting a failed or overlapping request only fetches what is missing
 //! (`force` turns this off). Transient upstream failures are retried with
 //! backoff for up to `RETRY_WINDOW` before the job fails.
@@ -30,11 +32,12 @@ use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::db::questdb::{CandleRow, IndexRow, Table};
+use crate::coinbase::client::{CoinbaseClient, CoinbaseError, MAX_CANDLES_PER_REQUEST};
+use crate::db::questdb::{CandleRow, CoinbaseRow, IndexRow, Table};
 use crate::error::AppError;
 use crate::kalshi::client::{KalshiError, SeriesMarket, Tier};
 use crate::model::Model;
-use crate::model::market::Market;
+use crate::model::market::{Market, valid_coinbase_product};
 use crate::state::AppState;
 
 const REQUEST_GAP: Duration = Duration::from_millis(300);
@@ -48,6 +51,13 @@ const RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long one upstream call may keep failing before the job gives up.
 const RETRY_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Authenticated Coinbase calls are limited to 30 per second.
+const COINBASE_REQUEST_GAP: Duration = Duration::from_millis(150);
+const MINUTE_MS: i64 = 60_000;
+const HOUR_MS: i64 = 3_600_000;
+/// One Coinbase request: five hours of 1-minute candles.
+const COINBASE_WINDOW_MS: i64 = 5 * HOUR_MS;
+const _: () = assert!(COINBASE_WINDOW_MS / MINUTE_MS < MAX_CANDLES_PER_REQUEST);
 /// CF Benchmarks publishes its real-time indices once per second.
 const INDEX_ROWS_PER_SECOND: i64 = 1;
 /// Share of the expected rows a window needs to count as already ingested.
@@ -67,6 +77,7 @@ pub enum IngestKind {
     #[default]
     Index,
     Contracts,
+    Coinbase,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +87,9 @@ pub struct IngestRequest {
     pub kind: IngestKind,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    /// `coinbase` only: overrides the market's `coinbase_product`.
+    #[serde(default)]
+    pub product: Option<String>,
     /// Fetch everything again, even what QuestDB already holds.
     #[serde(default)]
     pub force: bool,
@@ -181,6 +195,8 @@ pub struct IngestJob {
     pub kind: IngestKind,
     pub index_id: String,
     pub series_ticker: String,
+    /// `coinbase` only: the product being ingested.
+    pub product: Option<String>,
     pub status: JobStatus,
     /// Window of one upstream request: a CF Benchmarks timespan for `index`,
     /// the candlestick period for `contracts`.
@@ -195,7 +211,7 @@ pub struct IngestJob {
     pub markets_done: u64,
     pub force: bool,
     pub requests: u64,
-    /// Hour windows (`index`) or markets (`contracts`) not requested because
+    /// Windows (`index`, `coinbase`) or markets (`contracts`) not requested because
     /// QuestDB already held them.
     pub skipped: u64,
     pub retries: u64,
@@ -231,10 +247,27 @@ pub async fn start(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("market '{}'", req.tag)))?;
 
+    let coinbase = match req.kind {
+        IngestKind::Coinbase => {
+            let client = state.coinbase.clone().ok_or_else(|| {
+                AppError::BadRequest("coinbase is not configured (set CDP_API_KEY_ID and CDP_API_KEY_SECRET)".into())
+            })?;
+            let product = req.product.clone().or_else(|| market.coinbase_product.clone()).ok_or_else(|| {
+                AppError::BadRequest(format!("market '{}' has no coinbase_product; pass product", market.tag))
+            })?;
+            if !valid_coinbase_product(&product) {
+                return Err(AppError::BadRequest(format!("'{product}' is not a coinbase product id like BTC-USD")));
+            }
+            Some((client, product))
+        }
+        _ => None,
+    };
+
     let start_ms = req.start.timestamp_millis();
     let (cursor_ms, timespan_label) = match req.kind {
         IngestKind::Index => (timespan.floor(start_ms), timespan.as_str().to_string()),
         IngestKind::Contracts => (start_ms, format!("{CANDLE_PERIOD_MINUTES}m")),
+        IngestKind::Coinbase => (Timespan::Hour.floor(start_ms), "1m".to_string()),
     };
     let job = IngestJob {
         job_id: uuid::Uuid::new_v4().to_string(),
@@ -242,6 +275,7 @@ pub async fn start(
         kind: req.kind,
         index_id: market.index_id.clone(),
         series_ticker: market.series_ticker.clone(),
+        product: coinbase.as_ref().map(|(_, product)| product.clone()),
         status: JobStatus::Running,
         timespan: timespan_label,
         start_ms,
@@ -281,7 +315,7 @@ pub async fn start(
         cursor_ms,
         end_ms: job.end_ms,
     };
-    tokio::spawn(run_job(state.clone(), job, timespan));
+    tokio::spawn(run_job(state.clone(), job, timespan, coinbase.map(|(client, _)| client)));
     Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
@@ -300,11 +334,15 @@ pub async fn status(
         .ok_or_else(|| AppError::NotFound(format!("ingest job '{job_id}'")))
 }
 
-async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan) {
+async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan, coinbase: Option<Arc<CoinbaseClient>>) {
     let job_id = job.job_id.clone();
     let outcome = match job.kind {
         IngestKind::Index => ingest_loop(&state, &mut job, timespan).await,
         IngestKind::Contracts => contracts_loop(&state, &mut job).await,
+        IngestKind::Coinbase => match coinbase {
+            Some(client) => coinbase_loop(&state, &mut job, &client).await,
+            None => Err(anyhow::anyhow!("coinbase is not configured")),
+        },
     };
     job.finished_at = Some(Utc::now());
     match outcome {
@@ -334,12 +372,37 @@ async fn publish(state: &AppState, job: &IngestJob) {
     state.ingest_jobs.write().await.insert(job.job_id.clone(), job.clone());
 }
 
-/// Runs one Kalshi call for `job` and counts it once it gets through.
-/// Transient failures (see `KalshiError::is_transient`) are retried with
+/// What `throttled` needs to know about a failed upstream call.
+trait UpstreamError: std::error::Error + Send + Sync + 'static {
+    fn is_transient(&self) -> bool;
+    fn is_rate_limited(&self) -> bool;
+}
+
+impl UpstreamError for KalshiError {
+    fn is_transient(&self) -> bool {
+        KalshiError::is_transient(self)
+    }
+    fn is_rate_limited(&self) -> bool {
+        matches!(self, KalshiError::RateLimited)
+    }
+}
+
+impl UpstreamError for CoinbaseError {
+    fn is_transient(&self) -> bool {
+        CoinbaseError::is_transient(self)
+    }
+    fn is_rate_limited(&self) -> bool {
+        matches!(self, CoinbaseError::RateLimited)
+    }
+}
+
+/// Runs one upstream call for `job` and counts it once it gets through.
+/// Transient failures (see `UpstreamError::is_transient`) are retried with
 /// backoff until the call has been failing for `RETRY_WINDOW`.
-async fn throttled<T, F>(state: &AppState, job: &mut IngestJob, mut call: impl FnMut() -> F) -> anyhow::Result<T>
+async fn throttled<T, E, F>(state: &AppState, job: &mut IngestJob, mut call: impl FnMut() -> F) -> anyhow::Result<T>
 where
-    F: Future<Output = Result<T, KalshiError>>,
+    E: UpstreamError,
+    F: Future<Output = Result<T, E>>,
 {
     let first_attempt = Instant::now();
     let mut backoff = RETRY_BACKOFF_MIN;
@@ -354,10 +417,7 @@ where
             }
         };
         attempts += 1;
-        let delay = match error {
-            KalshiError::RateLimited => RATE_LIMIT_BACKOFF,
-            _ => backoff,
-        };
+        let delay = if error.is_rate_limited() { RATE_LIMIT_BACKOFF } else { backoff };
         if first_attempt.elapsed() + delay > RETRY_WINDOW {
             return Err(anyhow::Error::new(error).context(format!(
                 "gave up after {attempts} attempts over {}s at cursor {}",
@@ -365,7 +425,7 @@ where
                 job.cursor_ms
             )));
         }
-        tracing::warn!(job_id = %job.job_id, cursor = job.cursor_ms, attempts, ?delay, %error, "kalshi call failed; retrying");
+        tracing::warn!(job_id = %job.job_id, cursor = job.cursor_ms, attempts, ?delay, %error, "upstream call failed; retrying");
         job.retries += 1;
         job.retry_error = Some(error.to_string());
         publish(state, job).await;
@@ -434,6 +494,64 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, timespan: Timespan) 
         publish(state, job).await;
 
         tokio::time::sleep(REQUEST_GAP).await;
+    }
+    Ok(())
+}
+
+/// Whether QuestDB's `rows` cover the minutes of `[from_ms, to_ms)`. Coinbase
+/// has no candle for a minute without trades, hence the same tolerance as the
+/// index. A window still in progress at `now_ms` never does.
+fn coinbase_window_complete(rows: i64, from_ms: i64, to_ms: i64, now_ms: i64) -> bool {
+    let minutes = (to_ms - from_ms) / MINUTE_MS;
+    to_ms <= now_ms && minutes > 0 && rows * 100 >= minutes * INDEX_COMPLETE_PERCENT
+}
+
+async fn coinbase_loop(state: &AppState, job: &mut IngestJob, client: &CoinbaseClient) -> anyhow::Result<()> {
+    let product = job.product.clone().ok_or_else(|| anyhow::anyhow!("coinbase job without a product"))?;
+    let existing = if job.force {
+        HashMap::new()
+    } else {
+        state.questdb.coinbase_counts(&product, job.start_ms, job.end_ms).await.unwrap_or_else(|e| {
+            tracing::warn!(job_id = %job.job_id, error = %e, "cannot read existing candles; fetching everything");
+            HashMap::new()
+        })
+    };
+
+    while job.cursor_ms < job.end_ms {
+        let next_ms = job.cursor_ms + COINBASE_WINDOW_MS;
+        let from_ms = job.cursor_ms.max(job.start_ms);
+        let to_ms = next_ms.min(job.end_ms);
+        let rows: i64 =
+            (job.cursor_ms..next_ms).step_by(HOUR_MS as usize).filter_map(|hour| existing.get(&hour)).sum();
+        if coinbase_window_complete(rows, from_ms, to_ms, Utc::now().timestamp_millis()) {
+            job.skipped += 1;
+            job.cursor_ms = next_ms;
+            publish(state, job).await;
+            continue;
+        }
+
+        // Both bounds are candle start times and inclusive.
+        let last_start_ms = (to_ms - MINUTE_MS).max(from_ms);
+        let candles = throttled(state, job, || client.candles(&product, from_ms, last_start_ms)).await?;
+        for c in candles.iter().filter(|c| c.start_ms + MINUTE_MS > job.start_ms && c.start_ms < job.end_ms) {
+            let row = CoinbaseRow {
+                product: product.clone(),
+                open: c.open,
+                high: c.high,
+                low: c.low,
+                close: c.close,
+                volume: c.volume,
+                ts_ms: c.start_ms,
+                source: "rest_candles",
+            };
+            state.questdb.ilp.send(row.into()).await.map_err(|_| anyhow::anyhow!("ilp writer gone"))?;
+            job.rows += 1;
+        }
+
+        job.cursor_ms = next_ms;
+        publish(state, job).await;
+
+        tokio::time::sleep(COINBASE_REQUEST_GAP).await;
     }
     Ok(())
 }
@@ -562,7 +680,10 @@ async fn contracts_loop(state: &AppState, job: &mut IngestJob) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    use super::{IngestKind, IngestRequest, Timespan, candles_complete, index_window_complete, overlaps};
+    use super::{
+        IngestKind, IngestRequest, Timespan, candles_complete, coinbase_window_complete, index_window_complete,
+        overlaps,
+    };
     use crate::kalshi::client::{SeriesMarket, Tier};
 
     #[test]
@@ -573,6 +694,20 @@ mod tests {
         let body = body.replace("{", r#"{"kind":"contracts","#);
         let req: IngestRequest = serde_json::from_str(&body).unwrap();
         assert_eq!(req.kind, IngestKind::Contracts);
+        let body = body.replace("contracts", "coinbase").replace("}", r#","product":"ETH-USD"}"#);
+        let req: IngestRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!((req.kind, req.product.as_deref()), (IngestKind::Coinbase, Some("ETH-USD")));
+    }
+
+    #[test]
+    fn complete_coinbase_windows_are_skipped() {
+        const HOUR: i64 = 3_600_000;
+        let now = 100 * HOUR;
+        assert!(coinbase_window_complete(300, 0, 5 * HOUR, now));
+        assert!(coinbase_window_complete(290, 0, 5 * HOUR, now)); // a few minutes without trades
+        assert!(!coinbase_window_complete(120, 0, 5 * HOUR, now));
+        assert!(coinbase_window_complete(30, HOUR / 2, HOUR, now)); // clipped by the range
+        assert!(!coinbase_window_complete(300, 0, 5 * HOUR, 5 * HOUR - 1)); // still in progress
     }
 
     #[test]

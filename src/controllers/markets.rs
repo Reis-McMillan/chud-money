@@ -7,7 +7,7 @@ use mongodb::bson::doc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::db::questdb::{CandleSummary, Table, TableSummary};
+use crate::db::questdb::{CandleSummary, CoinbaseSummary, Table, TableSummary};
 use crate::error::AppError;
 use crate::feeds::FeedStatus;
 use crate::model::Model;
@@ -69,6 +69,8 @@ pub struct QuestdbSummary {
     pub live: TableSummary,
     pub hist: TableSummary,
     pub contracts: CandleSummary,
+    /// `None` for a market without a `coinbase_product`.
+    pub coinbase: Option<CoinbaseSummary>,
 }
 
 /// `GET /{tag}` — the document plus what QuestDB holds for its index and contracts.
@@ -85,7 +87,11 @@ pub async fn show(
         state.questdb.summary(Table::Hist, &market.index_id),
         state.questdb.candle_summary(&market.series_ticker),
     )?;
-    Ok(Json(MarketDetail { market, feed, questdb: QuestdbSummary { live, hist, contracts } }))
+    let coinbase = match &market.coinbase_product {
+        Some(product) => Some(state.questdb.coinbase_summary(product).await?),
+        None => None,
+    };
+    Ok(Json(MarketDetail { market, feed, questdb: QuestdbSummary { live, hist, contracts, coinbase } }))
 }
 
 /// `DELETE /{tag}` — stop the feed and remove the document. QuestDB rows are kept.

@@ -6,6 +6,7 @@
 //!
 //! Configuration is read from the environment (see `.env.example`).
 
+mod coinbase;
 mod config;
 mod controllers;
 mod db;
@@ -22,6 +23,8 @@ use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 use verys_rs_client::{Config as VerysConfig, VerysClient};
 
+use crate::coinbase::auth::Auth as CoinbaseAuth;
+use crate::coinbase::client::CoinbaseClient;
 use crate::config::Config;
 use crate::db::mongo::Mongo;
 use crate::db::questdb::Questdb;
@@ -52,6 +55,18 @@ async fn main() -> Result<()> {
     let auth = Auth::new(config.kalshi_key_id.clone(), &pem)?;
     let kalshi = Arc::new(KalshiClient::new(config.kalshi_env.endpoints(), auth));
     tracing::info!(env = config.kalshi_env.as_str(), key = kalshi.key_id(), "kalshi client ready");
+    let coinbase = match &config.cdp_key {
+        Some((key_id, secret)) => {
+            let auth = CoinbaseAuth::new(key_id.clone(), secret).context("CDP_API_KEY_SECRET")?;
+            let client = Arc::new(CoinbaseClient::new(auth));
+            tracing::info!(key = client.key_id(), "coinbase client ready");
+            Some(client)
+        }
+        None => {
+            tracing::info!("no CDP api key configured; coinbase ingest disabled");
+            None
+        }
+    };
     // JWKS only: the SPA runs the login, so no callback host, secret or scopes.
     let verys_client = Arc::new(VerysClient::new(VerysConfig::new(
         "",
@@ -77,6 +92,7 @@ async fn main() -> Result<()> {
         mongo,
         questdb,
         kalshi,
+        coinbase,
         feeds: Default::default(),
         ingest_jobs: Default::default(),
         verys_client,
