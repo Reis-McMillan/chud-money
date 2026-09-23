@@ -6,8 +6,6 @@
 //!   candlesticks (yes bid/ask and trade OHLC, volume, open interest) of
 //!   every market of the series that was open during the range, into
 //!   `contract_candles_hist`.
-//! - `coinbase`: 1-minute spot candles of the market's Coinbase product (or
-//!   the request's `product`), into `coinbase_candles_hist`.
 //!
 //! Before asking Kalshi for anything a job checks what QuestDB already holds
 //! and skips the windows / markets that are complete there, so
@@ -32,12 +30,11 @@ use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use crate::coinbase::client::{CoinbaseClient, CoinbaseError, MAX_CANDLES_PER_REQUEST};
-use crate::db::questdb::{CandleRow, CoinbaseRow, IndexRow, Table};
+use crate::db::questdb::{CandleRow, IndexRow, Table};
 use crate::error::AppError;
 use crate::kalshi::client::{KalshiError, SeriesMarket, Tier};
 use crate::model::Model;
-use crate::model::market::{Market, valid_coinbase_product};
+use crate::model::market::Market;
 use crate::state::AppState;
 
 const REQUEST_GAP: Duration = Duration::from_millis(300);
@@ -51,13 +48,6 @@ const RETRY_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long one upstream call may keep failing before the job gives up.
 const RETRY_WINDOW: Duration = Duration::from_secs(5 * 60);
-/// Authenticated Coinbase calls are limited to 30 per second.
-const COINBASE_REQUEST_GAP: Duration = Duration::from_millis(150);
-const MINUTE_MS: i64 = 60_000;
-const HOUR_MS: i64 = 3_600_000;
-/// One Coinbase request: five hours of 1-minute candles.
-const COINBASE_WINDOW_MS: i64 = 5 * HOUR_MS;
-const _: () = assert!(COINBASE_WINDOW_MS / MINUTE_MS < MAX_CANDLES_PER_REQUEST);
 /// CF Benchmarks publishes its real-time indices once per second.
 const INDEX_ROWS_PER_SECOND: i64 = 1;
 /// Share of the expected rows a window needs to count as already ingested.
@@ -77,7 +67,6 @@ pub enum IngestKind {
     #[default]
     Index,
     Contracts,
-    Coinbase,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,9 +76,6 @@ pub struct IngestRequest {
     pub kind: IngestKind,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
-    /// `coinbase` only: overrides the market's `coinbase_product`.
-    #[serde(default)]
-    pub product: Option<String>,
     /// Fetch everything again, even what QuestDB already holds.
     #[serde(default)]
     pub force: bool,
@@ -195,8 +181,6 @@ pub struct IngestJob {
     pub kind: IngestKind,
     pub index_id: String,
     pub series_ticker: String,
-    /// `coinbase` only: the product being ingested.
-    pub product: Option<String>,
     pub status: JobStatus,
     /// Window of one upstream request: a CF Benchmarks timespan for `index`,
     /// the candlestick period for `contracts`.
@@ -211,7 +195,7 @@ pub struct IngestJob {
     pub markets_done: u64,
     pub force: bool,
     pub requests: u64,
-    /// Windows (`index`, `coinbase`) or markets (`contracts`) not requested because
+    /// Windows (`index`) or markets (`contracts`) not requested because
     /// QuestDB already held them.
     pub skipped: u64,
     pub retries: u64,
@@ -247,27 +231,10 @@ pub async fn start(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("market '{}'", req.tag)))?;
 
-    let coinbase = match req.kind {
-        IngestKind::Coinbase => {
-            let client = state.coinbase.clone().ok_or_else(|| {
-                AppError::BadRequest("coinbase is not configured (set CDP_API_KEY_ID and CDP_API_KEY_SECRET)".into())
-            })?;
-            let product = req.product.clone().or_else(|| market.coinbase_product.clone()).ok_or_else(|| {
-                AppError::BadRequest(format!("market '{}' has no coinbase_product; pass product", market.tag))
-            })?;
-            if !valid_coinbase_product(&product) {
-                return Err(AppError::BadRequest(format!("'{product}' is not a coinbase product id like BTC-USD")));
-            }
-            Some((client, product))
-        }
-        _ => None,
-    };
-
     let start_ms = req.start.timestamp_millis();
     let (cursor_ms, timespan_label) = match req.kind {
         IngestKind::Index => (timespan.floor(start_ms), timespan.as_str().to_string()),
         IngestKind::Contracts => (start_ms, format!("{CANDLE_PERIOD_MINUTES}m")),
-        IngestKind::Coinbase => (Timespan::Hour.floor(start_ms), "1m".to_string()),
     };
     let job = IngestJob {
         job_id: uuid::Uuid::new_v4().to_string(),
@@ -275,7 +242,6 @@ pub async fn start(
         kind: req.kind,
         index_id: market.index_id.clone(),
         series_ticker: market.series_ticker.clone(),
-        product: coinbase.as_ref().map(|(_, product)| product.clone()),
         status: JobStatus::Running,
         timespan: timespan_label,
         start_ms,
@@ -315,15 +281,12 @@ pub async fn start(
         cursor_ms,
         end_ms: job.end_ms,
     };
-    tokio::spawn(run_job(state.clone(), job, timespan, coinbase.map(|(client, _)| client)));
+    tokio::spawn(run_job(state.clone(), job, timespan));
     Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
 /// `GET /ingest/{job_id}`
-pub async fn status(
-    Path(job_id): Path<String>,
-    State(state): State<AppState>,
-) -> Result<Json<IngestJob>, AppError> {
+pub async fn status(Path(job_id): Path<String>, State(state): State<AppState>) -> Result<Json<IngestJob>, AppError> {
     state
         .ingest_jobs
         .read()
@@ -334,15 +297,11 @@ pub async fn status(
         .ok_or_else(|| AppError::NotFound(format!("ingest job '{job_id}'")))
 }
 
-async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan, coinbase: Option<Arc<CoinbaseClient>>) {
+async fn run_job(state: AppState, mut job: IngestJob, timespan: Timespan) {
     let job_id = job.job_id.clone();
     let outcome = match job.kind {
         IngestKind::Index => ingest_loop(&state, &mut job, timespan).await,
         IngestKind::Contracts => contracts_loop(&state, &mut job).await,
-        IngestKind::Coinbase => match coinbase {
-            Some(client) => coinbase_loop(&state, &mut job, &client).await,
-            None => Err(anyhow::anyhow!("coinbase is not configured")),
-        },
     };
     job.finished_at = Some(Utc::now());
     match outcome {
@@ -384,15 +343,6 @@ impl UpstreamError for KalshiError {
     }
     fn is_rate_limited(&self) -> bool {
         matches!(self, KalshiError::RateLimited)
-    }
-}
-
-impl UpstreamError for CoinbaseError {
-    fn is_transient(&self) -> bool {
-        CoinbaseError::is_transient(self)
-    }
-    fn is_rate_limited(&self) -> bool {
-        matches!(self, CoinbaseError::RateLimited)
     }
 }
 
@@ -457,7 +407,8 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, timespan: Timespan) 
     while job.cursor_ms < job.end_ms {
         let next_ms = timespan.next(job.cursor_ms);
         let rows = existing.get(&job.cursor_ms).copied().unwrap_or(0);
-        if index_window_complete(rows, job.cursor_ms, next_ms, job.start_ms, job.end_ms, Utc::now().timestamp_millis()) {
+        if index_window_complete(rows, job.cursor_ms, next_ms, job.start_ms, job.end_ms, Utc::now().timestamp_millis())
+        {
             job.skipped += 1;
             job.cursor_ms = next_ms;
             publish(state, job).await;
@@ -498,64 +449,6 @@ async fn ingest_loop(state: &AppState, job: &mut IngestJob, timespan: Timespan) 
     Ok(())
 }
 
-/// Whether QuestDB's `rows` cover the minutes of `[from_ms, to_ms)`. Coinbase
-/// has no candle for a minute without trades, hence the same tolerance as the
-/// index. A window still in progress at `now_ms` never does.
-fn coinbase_window_complete(rows: i64, from_ms: i64, to_ms: i64, now_ms: i64) -> bool {
-    let minutes = (to_ms - from_ms) / MINUTE_MS;
-    to_ms <= now_ms && minutes > 0 && rows * 100 >= minutes * INDEX_COMPLETE_PERCENT
-}
-
-async fn coinbase_loop(state: &AppState, job: &mut IngestJob, client: &CoinbaseClient) -> anyhow::Result<()> {
-    let product = job.product.clone().ok_or_else(|| anyhow::anyhow!("coinbase job without a product"))?;
-    let existing = if job.force {
-        HashMap::new()
-    } else {
-        state.questdb.coinbase_counts(&product, job.start_ms, job.end_ms).await.unwrap_or_else(|e| {
-            tracing::warn!(job_id = %job.job_id, error = %e, "cannot read existing candles; fetching everything");
-            HashMap::new()
-        })
-    };
-
-    while job.cursor_ms < job.end_ms {
-        let next_ms = job.cursor_ms + COINBASE_WINDOW_MS;
-        let from_ms = job.cursor_ms.max(job.start_ms);
-        let to_ms = next_ms.min(job.end_ms);
-        let rows: i64 =
-            (job.cursor_ms..next_ms).step_by(HOUR_MS as usize).filter_map(|hour| existing.get(&hour)).sum();
-        if coinbase_window_complete(rows, from_ms, to_ms, Utc::now().timestamp_millis()) {
-            job.skipped += 1;
-            job.cursor_ms = next_ms;
-            publish(state, job).await;
-            continue;
-        }
-
-        // Both bounds are candle start times and inclusive.
-        let last_start_ms = (to_ms - MINUTE_MS).max(from_ms);
-        let candles = throttled(state, job, || client.candles(&product, from_ms, last_start_ms)).await?;
-        for c in candles.iter().filter(|c| c.start_ms + MINUTE_MS > job.start_ms && c.start_ms < job.end_ms) {
-            let row = CoinbaseRow {
-                product: product.clone(),
-                open: c.open,
-                high: c.high,
-                low: c.low,
-                close: c.close,
-                volume: c.volume,
-                ts_ms: c.start_ms,
-                source: "rest_candles",
-            };
-            state.questdb.ilp.send(row.into()).await.map_err(|_| anyhow::anyhow!("ilp writer gone"))?;
-            job.rows += 1;
-        }
-
-        job.cursor_ms = next_ms;
-        publish(state, job).await;
-
-        tokio::time::sleep(COINBASE_REQUEST_GAP).await;
-    }
-    Ok(())
-}
-
 /// Whether a market was open at any point of `[start_ms, end_ms)`.
 fn overlaps(market: &SeriesMarket, start_ms: i64, end_ms: i64) -> bool {
     market.close_ms > start_ms && market.open_ms < end_ms
@@ -590,10 +483,9 @@ async fn markets_in_range(state: &AppState, job: &mut IngestJob) -> anyhow::Resu
     for tier in tiers {
         let mut cursor: Option<String> = None;
         loop {
-            let (page, next) = throttled(state, job, || {
-                state.kalshi.series_markets_page(&series, tier, start_ms, cursor.as_deref())
-            })
-            .await?;
+            let (page, next) =
+                throttled(state, job, || state.kalshi.series_markets_page(&series, tier, start_ms, cursor.as_deref()))
+                    .await?;
             // Pages run newest close first and the historical listing cannot
             // be filtered by time, so stop once a page reaches past the start.
             let past_start = page.last().is_none_or(|m| m.close_ms <= start_ms);
@@ -680,10 +572,7 @@ async fn contracts_loop(state: &AppState, job: &mut IngestJob) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        IngestKind, IngestRequest, Timespan, candles_complete, coinbase_window_complete, index_window_complete,
-        overlaps,
-    };
+    use super::{IngestKind, IngestRequest, Timespan, candles_complete, index_window_complete, overlaps};
     use crate::kalshi::client::{SeriesMarket, Tier};
 
     #[test]
@@ -694,20 +583,8 @@ mod tests {
         let body = body.replace("{", r#"{"kind":"contracts","#);
         let req: IngestRequest = serde_json::from_str(&body).unwrap();
         assert_eq!(req.kind, IngestKind::Contracts);
-        let body = body.replace("contracts", "coinbase").replace("}", r#","product":"ETH-USD"}"#);
-        let req: IngestRequest = serde_json::from_str(&body).unwrap();
-        assert_eq!((req.kind, req.product.as_deref()), (IngestKind::Coinbase, Some("ETH-USD")));
-    }
-
-    #[test]
-    fn complete_coinbase_windows_are_skipped() {
-        const HOUR: i64 = 3_600_000;
-        let now = 100 * HOUR;
-        assert!(coinbase_window_complete(300, 0, 5 * HOUR, now));
-        assert!(coinbase_window_complete(290, 0, 5 * HOUR, now)); // a few minutes without trades
-        assert!(!coinbase_window_complete(120, 0, 5 * HOUR, now));
-        assert!(coinbase_window_complete(30, HOUR / 2, HOUR, now)); // clipped by the range
-        assert!(!coinbase_window_complete(300, 0, 5 * HOUR, 5 * HOUR - 1)); // still in progress
+        let body = body.replace("contracts", "coinbase");
+        assert!(serde_json::from_str::<IngestRequest>(&body).is_err(), "coinbase candles are no longer a backfill");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! chud-money: axum backend for a Kalshi trading dashboard.
 //!
 //! Stores tracked markets in MongoDB, streams each market's CF Benchmarks
-//! index and Kalshi orderbooks over a per-market feed task, writes index
-//! values to QuestDB, and exposes REST + websocket proxy endpoints.
+//! index, Kalshi ticker and orderbooks (plus the Coinbase spot ticker and
+//! level2 book when the market names a product) over per-market feed tasks,
+//! writes them to QuestDB, and exposes REST + websocket proxy endpoints.
 //!
 //! Configuration is read from the environment (see `.env.example`).
 
@@ -24,7 +25,6 @@ use tracing_subscriber::EnvFilter;
 use verys_rs_client::{Config as VerysConfig, VerysClient};
 
 use crate::coinbase::auth::Auth as CoinbaseAuth;
-use crate::coinbase::client::CoinbaseClient;
 use crate::config::Config;
 use crate::db::mongo::Mongo;
 use crate::db::questdb::Questdb;
@@ -55,15 +55,14 @@ async fn main() -> Result<()> {
     let auth = Auth::new(config.kalshi_key_id.clone(), &pem)?;
     let kalshi = Arc::new(KalshiClient::new(config.kalshi_env.endpoints(), auth));
     tracing::info!(env = config.kalshi_env.as_str(), key = kalshi.key_id(), "kalshi client ready");
-    let coinbase = match &config.cdp_key {
+    let coinbase_auth = match &config.cdp_key {
         Some((key_id, secret)) => {
             let auth = CoinbaseAuth::new(key_id.clone(), secret).context("CDP_API_KEY_SECRET")?;
-            let client = Arc::new(CoinbaseClient::new(auth));
-            tracing::info!(key = client.key_id(), "coinbase client ready");
-            Some(client)
+            tracing::info!(key = %auth.key_id, "coinbase websocket auth ready");
+            Some(Arc::new(auth))
         }
         None => {
-            tracing::info!("no CDP api key configured; coinbase ingest disabled");
+            tracing::info!("no CDP api key configured; coinbase websockets will subscribe unauthenticated");
             None
         }
     };
@@ -92,7 +91,7 @@ async fn main() -> Result<()> {
         mongo,
         questdb,
         kalshi,
-        coinbase,
+        coinbase_auth,
         feeds: Default::default(),
         ingest_jobs: Default::default(),
         verys_client,
@@ -107,9 +106,7 @@ async fn main() -> Result<()> {
     let bind = state.config.bind_addr.clone();
     let listener = tokio::net::TcpListener::bind(&bind).await.with_context(|| format!("binding {bind}"))?;
     tracing::info!(%bind, "listening");
-    axum::serve(listener, controllers::router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(listener, controllers::router(state)).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
 }
 

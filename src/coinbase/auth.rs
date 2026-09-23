@@ -1,5 +1,5 @@
-//! CDP request signing: a short-lived EdDSA JWT per request, sent as a bearer
-//! token.
+//! CDP request signing: a short-lived EdDSA JWT per REST request (sent as a
+//! bearer token) or per websocket subscribe (sent in the message).
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -7,7 +7,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, get_current_timestamp};
 use serde::Serialize;
 
-/// Host the JWT's `uri` claim is bound to.
+/// Host the REST JWT's `uri` claim is bound to.
+#[allow(dead_code)] // no REST caller today; kept with `bearer` for the next one
 pub const API_HOST: &str = "api.coinbase.com";
 /// Coinbase rejects tokens that live longer than two minutes.
 const TOKEN_TTL_SECS: u64 = 120;
@@ -26,7 +27,9 @@ struct Claims<'a> {
     iss: &'static str,
     nbf: u64,
     exp: u64,
-    uri: String,
+    /// `METHOD host/path` for REST; absent for websocket tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uri: Option<String>,
 }
 
 impl Auth {
@@ -45,20 +48,25 @@ impl Auth {
         Ok(Self { key_id, key: EncodingKey::from_ed_der(&pkcs8) })
     }
 
-    /// Bearer token for one request. `path` must exclude the query string:
-    /// the `uri` claim covers only `METHOD host/path`.
+    /// Bearer token for one REST request. `path` must exclude the query
+    /// string: the `uri` claim covers only `METHOD host/path`.
+    #[allow(dead_code)] // see `API_HOST`
     pub fn bearer(&self, method: &str, path: &str) -> Result<String> {
+        self.token(Some(format!("{method} {API_HOST}{path}")))
+    }
+
+    /// Token for one websocket `subscribe` message: the same claims without
+    /// `uri`, which Coinbase does not bind websocket tokens to.
+    pub fn ws_bearer(&self) -> Result<String> {
+        self.token(None)
+    }
+
+    fn token(&self, uri: Option<String>) -> Result<String> {
         let mut header = Header::new(Algorithm::EdDSA);
         header.kid = Some(self.key_id.clone());
         header.nonce = Some(format!("{:032x}", rand::random::<u128>()));
         let now = get_current_timestamp();
-        let claims = Claims {
-            sub: &self.key_id,
-            iss: "cdp",
-            nbf: now,
-            exp: now + TOKEN_TTL_SECS,
-            uri: format!("{method} {API_HOST}{path}"),
-        };
+        let claims = Claims { sub: &self.key_id, iss: "cdp", nbf: now, exp: now + TOKEN_TTL_SECS, uri };
         jsonwebtoken::encode(&header, &claims, &self.key).context("signing CDP token")
     }
 }
@@ -94,6 +102,20 @@ mod tests {
         assert_eq!(claims["iss"], "cdp");
         assert_eq!(claims["uri"], "GET api.coinbase.com/api/v3/brokerage/products/BTC-USD/candles");
         assert_eq!(claims["exp"].as_u64().unwrap() - claims["nbf"].as_u64().unwrap(), 120);
+    }
+
+    #[test]
+    fn websocket_token_has_no_uri() {
+        let pair = Ed25519KeyPair::from_seed_unchecked(&SEED).unwrap();
+        let public = pair.public_key().as_ref().to_vec();
+        let auth = Auth::new("key-id".into(), &B64.encode(SEED)).unwrap();
+        let token = auth.ws_bearer().unwrap();
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_required_spec_claims(&["exp", "nbf", "sub", "iss"]);
+        let claims = decode::<Value>(&token, &DecodingKey::from_ed_der(&public), &validation).unwrap().claims;
+        assert_eq!(claims["sub"], "key-id");
+        assert_eq!(claims["iss"], "cdp");
+        assert!(claims.get("uri").is_none(), "websocket tokens carry no uri: {claims}");
     }
 
     #[test]

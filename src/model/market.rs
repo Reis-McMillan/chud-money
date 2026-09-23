@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::{Model, ModelSpec};
 use crate::config::{Config, KalshiEnv};
-use crate::kalshi::stream::{CHANNEL_CF_5HZ, CHANNEL_ORDERBOOK};
+use crate::kalshi::stream::{CHANNEL_CF_5HZ, CHANNEL_ORDERBOOK, CHANNEL_TICKER};
 
 /// Path segments that would collide with fixed routes if used as a tag.
 pub const RESERVED_TAGS: &[&str] = &["add", "auth", "ingest", "ws"];
@@ -31,7 +31,8 @@ pub struct Market {
     pub series_ticker: String,
     /// CF Benchmarks index the series settles on, e.g. `BRTI`.
     pub index_id: String,
-    /// Coinbase spot product whose candles augment the index, e.g. `BTC-USD`.
+    /// Coinbase spot product streamed alongside the market (ticker and level2
+    /// book), e.g. `BTC-USD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinbase_product: Option<String>,
     pub title: String,
@@ -84,7 +85,7 @@ impl Market {
                 env,
                 rest_base: endpoints.rest.to_string(),
                 ws_url: endpoints.ws.to_string(),
-                channels: vec![CHANNEL_CF_5HZ.to_string(), CHANNEL_ORDERBOOK.to_string()],
+                channels: vec![CHANNEL_CF_5HZ.to_string(), CHANNEL_ORDERBOOK.to_string(), CHANNEL_TICKER.to_string()],
             },
             tag: input.tag,
             series_ticker: input.series_ticker,

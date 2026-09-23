@@ -1,5 +1,5 @@
-//! Coinbase (CDP) integration: JWT request signing and the REST client for
-//! historical spot candles.
+//! Coinbase (CDP) integration: JWT signing and the Advanced Trade websocket
+//! wire types.
 
 pub mod auth;
-pub mod client;
+pub mod stream;

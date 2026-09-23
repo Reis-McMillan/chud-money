@@ -1,5 +1,7 @@
-//! Registry of background feed tasks, one per market document.
+//! Registry of background feed tasks, one Kalshi session per market document
+//! plus a Coinbase session for markets that name a spot product.
 
+pub mod coinbase;
 pub mod task;
 
 use std::collections::HashMap;
@@ -12,7 +14,7 @@ use tokio::task::JoinHandle;
 
 use crate::kalshi::book::OrderBook;
 use crate::kalshi::client::OpenMarket;
-use crate::model::market::Market;
+use crate::model::market::{Market, valid_coinbase_product};
 use crate::state::AppState;
 
 const TICKER_CAPACITY: usize = 64;
@@ -27,8 +29,28 @@ pub struct FeedStatus {
     pub open_markets: Vec<OpenMarket>,
     pub last_value: Option<f64>,
     pub last_msg_at: Option<DateTime<Utc>>,
+    /// CF Benchmarks 5Hz frames.
     pub ticker_msgs: u64,
+    /// Kalshi per-market `ticker` frames.
+    pub contract_ticker_msgs: u64,
     pub orderbook_msgs: u64,
+    /// Rows not written because the QuestDB queue was full.
+    pub dropped_rows: u64,
+    pub last_error: Option<String>,
+    /// `None` for a market without a `coinbase_product`.
+    pub coinbase: Option<CoinbaseFeedStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CoinbaseFeedStatus {
+    pub product: String,
+    pub connected: bool,
+    pub reconnects: u32,
+    pub ticker_msgs: u64,
+    pub book_msgs: u64,
+    pub dropped_rows: u64,
+    pub last_price: Option<f64>,
+    pub last_msg_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
 }
 
@@ -48,11 +70,15 @@ pub struct FeedShared {
 pub struct FeedHandle {
     pub shared: Arc<FeedShared>,
     task: JoinHandle<()>,
+    coinbase_task: Option<JoinHandle<()>>,
 }
 
 impl Drop for FeedHandle {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(task) = &self.coinbase_task {
+            task.abort();
+        }
     }
 }
 
@@ -73,25 +99,39 @@ impl FeedRegistry {
         }
     }
 
-    /// Start the feed for `market`. Returns `false` (and does nothing) if one
-    /// is already running for that tag.
+    /// Start the feed(s) for `market`. Returns `false` (and does nothing) if
+    /// one is already running for that tag.
     pub async fn spawn(&self, state: &AppState, market: Market) -> bool {
         let mut map = self.inner.write().await;
         if map.contains_key(&market.tag) {
             return false;
         }
         let tag = market.tag.clone();
+        let product = match market.coinbase_product.clone() {
+            Some(p) if valid_coinbase_product(&p) => Some(p),
+            Some(p) => {
+                tracing::warn!(%tag, product = %p, "coinbase_product is not a product id; no coinbase feed");
+                None
+            }
+            None => None,
+        };
         let (ticker_tx, _) = broadcast::channel(TICKER_CAPACITY);
         let (orderbook_tx, _) = broadcast::channel(ORDERBOOK_CAPACITY);
+        let status = FeedStatus {
+            coinbase: product.as_ref().map(|p| CoinbaseFeedStatus { product: p.clone(), ..Default::default() }),
+            ..Default::default()
+        };
         let shared = Arc::new(FeedShared {
             market,
             ticker_tx,
             orderbook_tx,
             books: RwLock::new(HashMap::new()),
-            status: RwLock::new(FeedStatus::default()),
+            status: RwLock::new(status),
         });
         let task = tokio::spawn(task::run_feed(state.clone(), shared.clone()));
-        map.insert(tag, FeedHandle { shared, task });
+        let coinbase_task =
+            product.map(|p| tokio::spawn(coinbase::run_coinbase_feed(state.clone(), shared.clone(), p)));
+        map.insert(tag, FeedHandle { shared, task, coinbase_task });
         true
     }
 

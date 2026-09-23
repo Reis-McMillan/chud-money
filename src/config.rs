@@ -10,15 +10,11 @@ pub struct KalshiEndpoints {
     pub ws: &'static str,
 }
 
-pub const PROD: KalshiEndpoints = KalshiEndpoints {
-    rest: "https://external-api.kalshi.com",
-    ws: "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
-};
+pub const PROD: KalshiEndpoints =
+    KalshiEndpoints { rest: "https://external-api.kalshi.com", ws: "wss://external-api-ws.kalshi.com/trade-api/ws/v2" };
 
-pub const DEMO: KalshiEndpoints = KalshiEndpoints {
-    rest: "https://demo-api.kalshi.co",
-    ws: "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
-};
+pub const DEMO: KalshiEndpoints =
+    KalshiEndpoints { rest: "https://demo-api.kalshi.co", ws: "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2" };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,8 +62,9 @@ pub struct Config {
     pub kalshi_env: KalshiEnv,
     pub kalshi_key_id: String,
     pub kalshi_key_path: String,
-    /// Coinbase (CDP) API key: id and base64 Ed25519 private key. Coinbase
-    /// ingests are refused unless both are set.
+    /// Coinbase (CDP) API key: id and base64 Ed25519 private key. Optional:
+    /// with it the Coinbase websocket subscribes with a JWT, without it the
+    /// public channels are used unauthenticated.
     pub cdp_key: Option<(String, String)>,
 }
 
@@ -95,10 +92,10 @@ impl Config {
         let cdp_key = match (non_empty("CDP_API_KEY_ID"), non_empty("CDP_API_KEY_SECRET")) {
             (Some(id), Some(secret)) => Some((id, secret)),
             (None, None) => None,
-            // Not fatal: everything but the coinbase ingest works without it.
+            // Not fatal: the coinbase websocket falls back to unauthenticated.
             (id, _) => {
                 let missing = if id.is_some() { "CDP_API_KEY_SECRET" } else { "CDP_API_KEY_ID" };
-                tracing::warn!("{missing} is not set; coinbase ingest is disabled");
+                tracing::warn!("{missing} is not set; coinbase websockets will subscribe unauthenticated");
                 None
             }
         };
@@ -109,9 +106,7 @@ impl Config {
             bind_addr: var_or("BIND_ADDR", "0.0.0.0:3000"),
             client_id: std::env::var("CHUD_MONEY_API_CLIENT_ID")
                 .context("set CHUD_MONEY_API_CLIENT_ID to this API's Verys client id")?,
-            public_ws_base: var_or("PUBLIC_WS_BASE", "ws://localhost:3000")
-                .trim_end_matches('/')
-                .to_string(),
+            public_ws_base: var_or("PUBLIC_WS_BASE", "ws://localhost:3000").trim_end_matches('/').to_string(),
             mongo_uri: var_or("MONGO_URI", "mongodb://localhost:27017"),
             mongo_db: var_or("MONGO_DB", "chud"),
             questdb_ilp_conf: var_or("QUESTDB_ILP_CONF", "http::addr=localhost:9000;"),

@@ -4,7 +4,7 @@
 //! - `GET  /healthz`             liveness/readiness probe (touches no dependency)
 //! - `GET  /auth/me`             🔒 the caller's identity
 //! - `POST /add`                 🔒 create a market and start its feed
-//! - `POST /ingest`              🔒 start a historical backfill job (`kind`: `index`, `contracts` or `coinbase`)
+//! - `POST /ingest`              🔒 start a historical backfill job (`kind`: `index` or `contracts`)
 //! - `GET  /ingest/{job_id}`     backfill job status
 //! - `GET  /{tag}`               market document + feed status + QuestDB summary
 //! - `DELETE /{tag}`             🔒 stop the feed and delete the document
@@ -90,7 +90,12 @@ mod tests {
 
         let call = |method: Method, uri: &'static str| {
             let app = app.clone();
-            async move { app.oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap()).await.unwrap().status() }
+            async move {
+                app.oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status()
+            }
         };
         assert_eq!(call(Method::GET, "/btc-15m").await, StatusCode::OK);
         assert_eq!(call(Method::DELETE, "/btc-15m").await, StatusCode::UNAUTHORIZED);
