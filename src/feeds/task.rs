@@ -71,7 +71,8 @@ impl Session {
         self.strikes = markets.iter().map(|m| (m.ticker.clone(), m.floor_strike)).collect();
     }
 
-    /// Sids of the per-market subscriptions to update on a rotation.
+    /// Sids of the per-market subscriptions to update on a rotation; each
+    /// takes its own `update_subscription` command.
     fn market_sids(&self) -> Vec<u64> {
         [self.orderbook_sid, self.ticker_sid].into_iter().flatten().collect()
     }
@@ -207,11 +208,13 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>) -> Result<()> {
                         subscribe_markets(&mut ws, &mut cmd_id, &mut session, &open).await?;
                     }
                 } else {
-                    if !add.is_empty() {
-                        send_cmd(&mut ws, &mut cmd_id, |id| update_markets_cmd(id, &sids, "add_markets", &add)).await?;
-                    }
-                    if !del.is_empty() {
-                        send_cmd(&mut ws, &mut cmd_id, |id| update_markets_cmd(id, &sids, "delete_markets", &del)).await?;
+                    for sid in sids {
+                        if !add.is_empty() {
+                            send_cmd(&mut ws, &mut cmd_id, |id| update_markets_cmd(id, sid, "add_markets", &add)).await?;
+                        }
+                        if !del.is_empty() {
+                            send_cmd(&mut ws, &mut cmd_id, |id| update_markets_cmd(id, sid, "delete_markets", &del)).await?;
+                        }
                     }
                 }
                 subscribed = open;

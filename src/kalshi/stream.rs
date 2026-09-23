@@ -114,12 +114,14 @@ where
     subscribe_markets(id, CHANNEL_TICKER, tickers)
 }
 
-/// Add or remove markets on existing per-market subscriptions (`sids`).
-pub fn update_markets_cmd(id: u64, sids: &[u64], action: &str, tickers: &[String]) -> String {
+/// Add or remove markets on one existing per-market subscription. Kalshi
+/// rejects a `sids` list with more than one entry ("Exactly one subscription
+/// ID is required"), so callers send one command per subscription.
+pub fn update_markets_cmd(id: u64, sid: u64, action: &str, tickers: &[String]) -> String {
     json!({
         "id": id,
         "cmd": "update_subscription",
-        "params": { "sids": sids, "market_tickers": tickers, "action": action },
+        "params": { "sids": [sid], "market_tickers": tickers, "action": action },
     })
     .to_string()
 }
@@ -164,8 +166,8 @@ mod tests {
         let cmd: Value = serde_json::from_str(&subscribe_orderbook(4, &tickers)).unwrap();
         assert_eq!(cmd["params"]["channels"], json!(["orderbook_delta"]));
 
-        let cmd: Value = serde_json::from_str(&update_markets_cmd(5, &[7, 9], "add_markets", &tickers[1..])).unwrap();
+        let cmd: Value = serde_json::from_str(&update_markets_cmd(5, 7, "add_markets", &tickers[1..])).unwrap();
         assert_eq!(cmd["cmd"], "update_subscription");
-        assert_eq!(cmd["params"], json!({ "sids": [7, 9], "market_tickers": ["B"], "action": "add_markets" }));
+        assert_eq!(cmd["params"], json!({ "sids": [7], "market_tickers": ["B"], "action": "add_markets" }));
     }
 }
