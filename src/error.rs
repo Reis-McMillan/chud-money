@@ -22,6 +22,8 @@ pub enum AppError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
     #[error(transparent)]
     Model(#[from] ModelError),
     #[error(transparent)]
@@ -44,6 +46,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden(m) => (StatusCode::FORBIDDEN, json!({ "error": m })),
             AppError::NotFound(m) => (StatusCode::NOT_FOUND, json!({ "error": m })),
             AppError::Conflict(m) => (StatusCode::CONFLICT, json!({ "error": m })),
+            AppError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, json!({ "error": m })),
             AppError::Model(ModelError::Validation(errors)) => (
                 StatusCode::BAD_REQUEST,
                 json!({ "error": "document failed schema validation", "details": errors }),

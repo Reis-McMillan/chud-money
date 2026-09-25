@@ -7,12 +7,9 @@ use mongodb::bson::doc;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::db::questdb::{
-    COINBASE_BOOK_TABLE, COINBASE_TICKER_TABLE, CONTRACT_BOOK_TABLE, CONTRACT_TICKER_TABLE, CandleSummary, LiveSummary,
-    Table, TableSummary,
-};
 use crate::error::AppError;
 use crate::feeds::FeedStatus;
+use crate::feeds::summary::SummarySnapshot;
 use crate::model::Model;
 use crate::model::market::{AddMarket, Market};
 use crate::state::AppState;
@@ -64,47 +61,18 @@ pub async fn add(
 pub struct MarketDetail {
     pub market: Market,
     pub feed: Option<FeedStatus>,
-    pub questdb: QuestdbSummary,
+    /// Refreshed in the background by `feeds::summary`; `tables` is null
+    /// until the first refresh after the feed started.
+    pub questdb: SummarySnapshot,
 }
 
-#[derive(Serialize)]
-pub struct QuestdbSummary {
-    pub live: TableSummary,
-    pub hist: TableSummary,
-    pub contracts: CandleSummary,
-    pub contract_ticker: LiveSummary,
-    pub contract_book: LiveSummary,
-    /// `None` for a market without a `coinbase_product`.
-    pub coinbase_ticker: Option<LiveSummary>,
-    pub coinbase_book: Option<LiveSummary>,
-}
-
-/// `GET /{tag}` — the document plus what QuestDB holds for its index, contracts and spot feeds.
+/// `GET /{tag}` — the document, feed status, and the cached QuestDB summary.
 pub async fn show(Path(tag): Path<String>, State(state): State<AppState>) -> Result<Json<MarketDetail>, AppError> {
     let market = Market::find(&state.mongo, doc! { "tag": &tag })
         .await?
         .ok_or_else(|| AppError::NotFound(format!("market '{tag}'")))?;
     let feed = state.feeds.status(&tag).await;
-    let series = market.series_ticker.as_str();
-    let (live, hist, contracts, contract_ticker, contract_book) = tokio::try_join!(
-        state.questdb.summary(Table::Live, &market.index_id),
-        state.questdb.summary(Table::Hist, &market.index_id),
-        state.questdb.candle_summary(series),
-        state.questdb.live_summary(CONTRACT_TICKER_TABLE, "series_ticker", series),
-        state.questdb.live_summary(CONTRACT_BOOK_TABLE, "series_ticker", series),
-    )?;
-    let (coinbase_ticker, coinbase_book) = match &market.coinbase_product {
-        Some(product) => {
-            let (ticker, book) = tokio::try_join!(
-                state.questdb.live_summary(COINBASE_TICKER_TABLE, "product", product),
-                state.questdb.live_summary(COINBASE_BOOK_TABLE, "product", product),
-            )?;
-            (Some(ticker), Some(book))
-        }
-        None => (None, None),
-    };
-    let questdb =
-        QuestdbSummary { live, hist, contracts, contract_ticker, contract_book, coinbase_ticker, coinbase_book };
+    let questdb = state.feeds.summary(&tag).await.unwrap_or_default();
     Ok(Json(MarketDetail { market, feed, questdb }))
 }
 

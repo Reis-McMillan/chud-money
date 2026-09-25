@@ -3,8 +3,8 @@
 //! The SPA logs into Verys itself and exchanges its session for an access
 //! token scoped to this API (RFC 8693 token exchange with
 //! `audience = CHUD_MONEY_API_CLIENT_ID`). Requests present that token as
-//! `Authorization: Bearer <jwt>`; websocket upgrades, which a browser cannot
-//! add headers to, pass it as `?access_token=<jwt>` instead.
+//! `Authorization: Bearer <jwt>`; websocket upgrades and SSE streams, which
+//! a browser cannot add headers to, pass it as `?access_token=<jwt>` instead.
 //!
 //! Signature, issuer, audience and expiry are checked against the Verys
 //! signing key on every request. Exchanged tokens live for minutes and carry
@@ -30,7 +30,7 @@ use crate::state::AppState;
 /// Verys role an identity needs before it may use protected routes.
 pub const REQUIRED_ROLE: &str = "chud-money";
 
-/// Query parameter carrying the token on websocket upgrades.
+/// Query parameter carrying the token on websocket upgrades and SSE streams.
 pub const ACCESS_TOKEN_PARAM: &str = "access_token";
 
 /// Clock skew tolerated when checking `exp`.

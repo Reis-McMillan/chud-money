@@ -1,7 +1,9 @@
-//! Registry of background feed tasks, one Kalshi session per market document
-//! plus a Coinbase session for markets that name a spot product.
+//! Registry of background feed tasks: one Kalshi session per market document,
+//! a Coinbase session for markets that name a spot product, and a task that
+//! keeps the market's QuestDB summary cache fresh.
 
 pub mod coinbase;
+pub mod summary;
 pub mod task;
 
 use std::collections::HashMap;
@@ -16,6 +18,7 @@ use crate::kalshi::book::OrderBook;
 use crate::kalshi::client::OpenMarket;
 use crate::model::market::{Market, valid_coinbase_product};
 use crate::state::AppState;
+use summary::SummarySnapshot;
 
 const TICKER_CAPACITY: usize = 64;
 const ORDERBOOK_CAPACITY: usize = 1024;
@@ -54,7 +57,8 @@ pub struct CoinbaseFeedStatus {
     pub last_error: Option<String>,
 }
 
-/// Channels and status shared between a feed task and its subscribers.
+/// Channels, status and the QuestDB summary cache shared between a market's
+/// tasks and its readers.
 pub struct FeedShared {
     pub market: Market,
     /// Raw `cfbenchmarks_value_5hz` envelopes as received from Kalshi.
@@ -65,12 +69,15 @@ pub struct FeedShared {
     /// proxy client that connects mid-session can be handed a snapshot.
     pub books: RwLock<HashMap<String, OrderBook>>,
     pub status: RwLock<FeedStatus>,
+    /// Written by `summary::run_summary_refresh`, read by `GET /{tag}`.
+    pub summary: RwLock<SummarySnapshot>,
 }
 
 pub struct FeedHandle {
     pub shared: Arc<FeedShared>,
     task: JoinHandle<()>,
     coinbase_task: Option<JoinHandle<()>>,
+    summary_task: JoinHandle<()>,
 }
 
 impl Drop for FeedHandle {
@@ -79,6 +86,7 @@ impl Drop for FeedHandle {
         if let Some(task) = &self.coinbase_task {
             task.abort();
         }
+        self.summary_task.abort();
     }
 }
 
@@ -95,6 +103,14 @@ impl FeedRegistry {
     pub async fn status(&self, tag: &str) -> Option<FeedStatus> {
         match self.get(tag).await {
             Some(s) => Some(s.status.read().await.clone()),
+            None => None,
+        }
+    }
+
+    /// The market's cached QuestDB summaries, or `None` if no feed is running.
+    pub async fn summary(&self, tag: &str) -> Option<SummarySnapshot> {
+        match self.get(tag).await {
+            Some(s) => Some(s.summary.read().await.clone()),
             None => None,
         }
     }
@@ -127,11 +143,13 @@ impl FeedRegistry {
             orderbook_tx,
             books: RwLock::new(HashMap::new()),
             status: RwLock::new(status),
+            summary: RwLock::new(SummarySnapshot::default()),
         });
         let task = tokio::spawn(task::run_feed(state.clone(), shared.clone()));
         let coinbase_task =
             product.map(|p| tokio::spawn(coinbase::run_coinbase_feed(state.clone(), shared.clone(), p)));
-        map.insert(tag, FeedHandle { shared, task, coinbase_task });
+        let summary_task = tokio::spawn(summary::run_summary_refresh(state.clone(), shared.clone()));
+        map.insert(tag, FeedHandle { shared, task, coinbase_task, summary_task });
         true
     }
 

@@ -6,16 +6,18 @@
 //! - `POST /add`                 🔒 create a market and start its feed
 //! - `POST /ingest`              🔒 start a historical backfill job (`kind`: `index` or `contracts`)
 //! - `GET  /ingest/{job_id}`     backfill job status
-//! - `GET  /{tag}`               market document + feed status + QuestDB summary
+//! - `GET  /{tag}`               market document + feed status + cached QuestDB summary
 //! - `DELETE /{tag}`             🔒 stop the feed and delete the document
+//! - `GET  /{tag}/data/{table}`  🔒 stream a QuestDB table for one market as SSE (`?start=&end=`)
 //! - `GET  /ws/{tag}/ticker`     🔒 proxy of the CF Benchmarks 5Hz index stream
 //! - `GET  /ws/{tag}/orderbook`  🔒 proxy of Kalshi orderbook snapshot/delta frames
 //!
 //! 🔒 routes go through `middleware::authenticated` and need a bearer token.
-//! Websocket routes take it as `?access_token=` instead, since a browser
-//! cannot set headers on an upgrade request.
+//! Websocket and SSE routes also take it as `?access_token=`, since neither a
+//! browser upgrade request nor `EventSource` can set headers.
 
 pub mod auth;
+pub mod data;
 pub mod ingest;
 pub mod markets;
 pub mod ws;
@@ -41,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/add", post(markets::add))
         .route("/ingest", post(ingest::start))
         .route("/{tag}", delete(markets::remove))
+        .route("/{tag}/data/{table}", get(data::stream))
         .route("/ws/{tag}/ticker", get(ws::ticker))
         .route("/ws/{tag}/orderbook", get(ws::orderbook))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticated));
@@ -75,18 +78,24 @@ mod tests {
         StatusCode::UNAUTHORIZED.into_response()
     }
 
-    /// Same shape as `router`: a guarded `DELETE /{tag}` merged into a router
-    /// that already has `GET /{tag}`. axum panics at construction if it
-    /// cannot merge the two method routers, so building it is the test. The
-    /// websocket route shows the guard runs before any upgrade handling.
+    /// Same shape as `router`: a guarded `DELETE /{tag}` and `/{tag}/data/{table}`
+    /// merged into a router that already has `GET /{tag}` and `/ingest/{job_id}`.
+    /// axum panics at construction if it cannot merge the method routers or
+    /// the captures conflict, so building it is the test. The websocket route
+    /// shows the guard runs before any upgrade handling.
     #[tokio::test]
     async fn protected_methods_merge_into_public_paths() {
         let protected = Router::new()
             .route("/add", post(ok))
             .route("/{tag}", delete(ok))
+            .route("/{tag}/data/{table}", get(ok))
             .route("/ws/{tag}/ticker", get(ok))
             .route_layer(middleware::from_fn(deny));
-        let app: Router = Router::new().route("/", get(ok)).route("/{tag}", get(ok)).merge(protected);
+        let app: Router = Router::new()
+            .route("/", get(ok))
+            .route("/ingest/{job_id}", get(ok))
+            .route("/{tag}", get(ok))
+            .merge(protected);
 
         let call = |method: Method, uri: &'static str| {
             let app = app.clone();
@@ -101,6 +110,8 @@ mod tests {
         assert_eq!(call(Method::DELETE, "/btc-15m").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::POST, "/add").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/ws/btc-15m/ticker").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(Method::GET, "/btc-15m/data/contract_book_live").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(Method::GET, "/ingest/abc").await, StatusCode::OK);
         assert_eq!(call(Method::GET, "/").await, StatusCode::OK);
     }
 

@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
+# Generator syntax for the SSE export in controllers::data and the windowed
+# query loop behind it: nested awaits plus terminal events, which
+# `futures_util::stream::try_unfold` can only express as a hand-rolled state
+# machine.
+async-stream = "0.3"
 axum = { version = "0.8", features = ["ws", "json", "macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

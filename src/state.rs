@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tokio::sync::Semaphore;
 use verys_rs_client::VerysClient;
 
 use crate::coinbase::auth::Auth as CoinbaseAuth;
@@ -25,4 +26,6 @@ pub struct AppState {
     pub ingest_jobs: IngestJobs,
     /// Used only to fetch and cache the Verys signing key (JWKS).
     pub verys_client: Arc<VerysClient>,
+    /// Caps concurrent `GET /{tag}/data/{table}` exports; see `controllers::data`.
+    pub data_streams: Arc<Semaphore>,
 }
