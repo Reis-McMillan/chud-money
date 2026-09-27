@@ -9,13 +9,20 @@
 //!
 //! Events, each with a JSON body:
 //!
-//! - `meta`: table, key, effective range and column names; sent first.
-//! - `row`: one row, `id` = its `ts`.
+//! - `meta`: table, key, effective range and `columns`, the column names;
+//!   sent first.
+//! - `rows`: a JSON array of rows, each a JSON array of values in `columns`
+//!   order (text and timestamps as strings, numbers as numbers, NULL as
+//!   null). `id` = the `ts` of the batch's last row. Batches hold up to
+//!   `BATCH_ROWS` rows or about `BATCH_BYTES` of JSON, whichever fills
+//!   first: one SSE event is one HTTP chunk and one write, so per-row events
+//!   cap throughput at a few thousand rows a second.
 //! - `done`: row count and elapsed time; the stream ends after it. Clients
 //!   must `close()` here, otherwise `EventSource` reconnects (cheaply, with
 //!   `Last-Event-ID`, but forever).
 //! - `error`: QuestDB failed mid-stream; carries the rows sent so far and
-//!   `resume_from`, the last `ts` delivered. The stream ends after it.
+//!   `resume_from`, the last `ts` delivered. Rows read before the failure
+//!   are flushed in a final `rows` event first. The stream ends after it.
 //!
 //! A `Last-Event-ID` header (which `EventSource` sends on reconnect) replaces
 //! `start`. Resuming is at-least-once: every row sharing that microsecond is
@@ -56,6 +63,27 @@ pub const DATA_STREAMS: usize = 2;
 /// Reconnect delay asked of `EventSource`, so a client that ignores `done`
 /// does not hammer the endpoint.
 const RETRY: Duration = Duration::from_secs(10);
+
+/// Rows per `rows` event, and the JSON size at which a batch is flushed
+/// early. The row cap bounds what a client parses per event; the byte cap
+/// keeps wide rows (candles are 20 columns) from making events of several
+/// hundred KB.
+pub const BATCH_ROWS: usize = 1_000;
+pub const BATCH_BYTES: usize = 64 * 1024;
+
+/// When a `rows` batch is flushed: at `rows` rows, or once its JSON reaches
+/// `bytes`. Tests use small values; `stream` uses `BATCH_ROWS`/`BATCH_BYTES`.
+#[derive(Debug, Clone, Copy)]
+pub struct BatchLimits {
+    pub rows: usize,
+    pub bytes: usize,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        BatchLimits { rows: BATCH_ROWS, bytes: BATCH_BYTES }
+    }
+}
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 pub type SseResponse = Sse<KeepAliveStream<EventStream>>;
@@ -118,44 +146,110 @@ pub async fn stream(
     };
     tracing::info!(%tag, table = table.name(), user = %user.id, start_us, end_us, "data stream opened");
     let rows = state.questdb.stream_data(table, key.clone(), start_us, end_us).await?;
-    Ok(sse(Box::pin(events(table, key, (start_us, end_us), rows, permit))))
+    Ok(sse(Box::pin(events(table, key, (start_us, end_us), rows, permit, BatchLimits::default()))))
 }
 
 fn sse(events: EventStream) -> SseResponse {
     Sse::new(events).keep_alive(KeepAlive::default())
 }
 
-/// `meta`, the rows, then `done` or `error`. Holds the concurrency permit
-/// for as long as the client keeps reading.
+/// `meta`, the rows in `rows` batches, then `done` or `error`. Holds the
+/// concurrency permit for as long as the client keeps reading.
 fn events(
     table: DataTable,
     key: String,
     range: (i64, i64),
     rows: DataStream,
     permit: OwnedSemaphorePermit,
+    limits: BatchLimits,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
         let _permit = permit;
         let started = Instant::now();
         yield Ok(meta_event(table, &key, Some(range)));
         let mut rows = std::pin::pin!(rows);
+        let mut batch = Batch::new(limits);
+        // Rows delivered in flushed batches, and the `ts` of the last one:
+        // what `error` reports, so a client resuming from it misses nothing.
         let mut sent: u64 = 0;
         let mut last_ts = None;
         while let Some(row) = rows.next().await {
             match row {
                 Ok(row) => {
-                    sent += 1;
-                    last_ts = Some(row.ts.clone());
-                    yield Ok(row_event(row));
+                    if let Some(event) = batch.push(row) {
+                        sent += event.rows;
+                        last_ts = Some(event.last_ts.clone());
+                        yield Ok(rows_event(event));
+                    }
                 }
                 Err(e) => {
+                    if let Some(event) = batch.flush() {
+                        sent += event.rows;
+                        last_ts = Some(event.last_ts.clone());
+                        yield Ok(rows_event(event));
+                    }
                     tracing::warn!(table = table.name(), sent, error = %e, "data stream failed");
                     yield Ok(error_event(&e.to_string(), sent, last_ts));
                     return;
                 }
             }
         }
+        if let Some(event) = batch.flush() {
+            sent += event.rows;
+            yield Ok(rows_event(event));
+        }
         yield Ok(done_event(sent, Some(range), started.elapsed()));
+    }
+}
+
+/// Rows accumulated for one `rows` event: `json` is the array text so far,
+/// open (no closing `]`) until flushed.
+struct Batch {
+    limits: BatchLimits,
+    json: String,
+    rows: u64,
+    last_ts: String,
+}
+
+/// One flushed batch: the complete JSON array and what it holds.
+struct RowsBatch {
+    json: String,
+    rows: u64,
+    last_ts: String,
+}
+
+impl Batch {
+    fn new(limits: BatchLimits) -> Self {
+        Batch { limits, json: Self::open(limits), rows: 0, last_ts: String::new() }
+    }
+
+    /// An empty, open array, sized so a full batch does not regrow.
+    fn open(limits: BatchLimits) -> String {
+        let mut json = String::with_capacity(limits.bytes.min(BATCH_BYTES) + 256);
+        json.push('[');
+        json
+    }
+
+    /// Adds `row`; returns the batch when that filled it.
+    fn push(&mut self, row: DataRow) -> Option<RowsBatch> {
+        if self.rows > 0 {
+            self.json.push(',');
+        }
+        self.json.push_str(&row.json);
+        self.rows += 1;
+        self.last_ts = row.ts;
+        (self.rows as usize >= self.limits.rows || self.json.len() >= self.limits.bytes).then(|| self.take())
+    }
+
+    /// The batch so far, if it holds anything.
+    fn flush(&mut self) -> Option<RowsBatch> {
+        (self.rows > 0).then(|| self.take())
+    }
+
+    fn take(&mut self) -> RowsBatch {
+        let mut json = std::mem::replace(&mut self.json, Self::open(self.limits));
+        json.push(']');
+        RowsBatch { json, rows: std::mem::take(&mut self.rows), last_ts: std::mem::take(&mut self.last_ts) }
     }
 }
 
@@ -172,8 +266,8 @@ fn meta_event(table: DataTable, key: &str, range: Option<(i64, i64)>) -> Event {
     json_event("meta", body).retry(RETRY)
 }
 
-fn row_event(row: DataRow) -> Event {
-    json_event("row", row.json).id(row.ts)
+fn rows_event(batch: RowsBatch) -> Event {
+    text_event("rows", batch.json).id(batch.last_ts)
 }
 
 fn done_event(rows: u64, range: Option<(i64, i64)>, elapsed: Duration) -> Event {
@@ -196,8 +290,13 @@ fn error_event(error: &str, rows: u64, resume_from: Option<String>) -> Event {
 }
 
 fn json_event(name: &str, body: Value) -> Event {
-    // Compact JSON has no newlines, so one `data:` line per event.
-    Event::default().event(name).data(body.to_string())
+    text_event(name, body.to_string())
+}
+
+/// `data` must be compact JSON: it has no newlines outside escaped strings,
+/// so the event is a single `data:` line.
+fn text_event(name: &str, data: String) -> Event {
+    Event::default().event(name).data(data)
 }
 
 fn ts_string(us: i64) -> String {
@@ -232,6 +331,8 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     #[test]
     fn range_parsing() {
@@ -261,14 +362,100 @@ mod tests {
         (fields, data.unwrap())
     }
 
+    fn row(n: u64) -> DataRow {
+        DataRow { ts: format!("2026-09-24T00:00:00.{n:06}Z"), json: format!(r#"["KXBTC15M",{n}]"#) }
+    }
+
+    /// Every event the given rows produce, with `data` parsed, as
+    /// `(fields, data)`.
+    async fn run(
+        rows: Vec<Result<DataRow, tokio_postgres::Error>>,
+        limits: BatchLimits,
+    ) -> Vec<(Vec<(String, String)>, Value)> {
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let events =
+            events(DataTable::ContractBookLive, "K".into(), (0, 1), Box::pin(stream::iter(rows)), permit, limits);
+        let res = Sse::new(events).into_response();
+        let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+        body.strip_suffix("\n\n")
+            .unwrap()
+            .split("\n\n")
+            .map(|f| {
+                let (fields, data) = frame(f);
+                (fields.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), data)
+            })
+            .collect()
+    }
+
+    /// A stream error that `events` can be handed: tokio-postgres exposes no
+    /// constructor, so provoke one by connecting to nothing.
+    async fn pg_error() -> tokio_postgres::Error {
+        match tokio_postgres::connect("host=127.0.0.1 port=1 user=x connect_timeout=1", tokio_postgres::NoTls).await {
+            Err(e) => e,
+            Ok(_) => panic!("port 1 is not a postgres server"),
+        }
+    }
+
+    /// Batches close at the row limit or the byte limit, carry the last
+    /// row's `ts` as `id`, and the tail is flushed before `done`.
+    #[tokio::test]
+    async fn batches_by_rows_and_bytes() {
+        let rows = (1..=25).map(|n| Ok(row(n))).collect();
+        let events = run(rows, BatchLimits { rows: 10, bytes: usize::MAX }).await;
+        assert_eq!(events.len(), 5, "{events:?}");
+        assert_eq!(events[0].0[0].1, "meta");
+        for (i, (fields, data)) in events[1..4].iter().enumerate() {
+            let last = (10 * (i as u64 + 1)).min(25);
+            let expected_id = format!("2026-09-24T00:00:00.{last:06}Z");
+            assert_eq!(*fields, vec![("event".to_string(), "rows".to_string()), ("id".to_string(), expected_id)]);
+            let rows = data.as_array().unwrap();
+            assert_eq!(rows.len(), if i < 2 { 10 } else { 5 });
+            assert_eq!(rows[0], json!(["KXBTC15M", last - rows.len() as u64 + 1]));
+            assert_eq!(rows[rows.len() - 1], json!(["KXBTC15M", last]));
+        }
+        assert_eq!(events[4].0, vec![("event".to_string(), "done".to_string())]);
+        assert_eq!(events[4].1["rows"], json!(25));
+
+        // A row is ["KXBTC15M",n]: 16 bytes for n < 10, so 40 bytes fills at the third row.
+        let rows = (1..=7).map(|n| Ok(row(n))).collect();
+        let events = run(rows, BatchLimits { rows: usize::MAX, bytes: 40 }).await;
+        let sizes: Vec<usize> = events[1..events.len() - 1].iter().map(|(_, d)| d.as_array().unwrap().len()).collect();
+        assert_eq!(sizes, vec![3, 3, 1]);
+        assert_eq!(events.last().unwrap().1["rows"], json!(7));
+    }
+
+    /// Rows read before a failure go out in a final `rows` event, and
+    /// `error` counts them and points `resume_from` at the last one.
+    #[tokio::test]
+    async fn error_flushes_partial_batch() {
+        let mut rows: Vec<Result<DataRow, _>> = (1..=7).map(|n| Ok(row(n))).collect();
+        rows.push(Err(pg_error().await));
+        let events = run(rows, BatchLimits { rows: 5, bytes: usize::MAX }).await;
+        let kinds: Vec<&str> = events.iter().map(|(f, _)| f[0].1.as_str()).collect();
+        assert_eq!(kinds, vec!["meta", "rows", "rows", "error"]);
+        assert_eq!(events[2].1.as_array().unwrap().len(), 2);
+        assert_eq!(events[2].0[1].1, "2026-09-24T00:00:00.000007Z");
+        assert_eq!(events[3].1["rows"], json!(7));
+        assert_eq!(events[3].1["resume_from"], json!("2026-09-24T00:00:00.000007Z"));
+
+        // No rows at all: just `error`, with nothing to resume from.
+        let events = run(vec![Err(pg_error().await)], BatchLimits::default()).await;
+        let kinds: Vec<&str> = events.iter().map(|(f, _)| f[0].1.as_str()).collect();
+        assert_eq!(kinds, vec!["meta", "error"]);
+        assert_eq!(events[1].1["rows"], json!(0));
+        assert_eq!(events[1].1["resume_from"], Value::Null);
+    }
+
     /// The wire text of one event of each kind.
     #[tokio::test]
     async fn event_encoding() {
         let ts = "2026-09-24T00:00:00.000001Z";
-        let row = DataRow { ts: ts.into(), json: json!({ "price": 0.42, "size": 3 }) };
+        let mut batch = Batch::new(BatchLimits::default());
+        assert!(batch.push(DataRow { ts: "2026-09-24T00:00:00.000000Z".into(), json: r#"[0.41,2]"#.into() }).is_none());
+        assert!(batch.push(DataRow { ts: ts.into(), json: r#"[0.42,3]"#.into() }).is_none());
         let events = vec![
             Ok::<_, Infallible>(meta_event(DataTable::ContractBookLive, "KXBTC15M", Some((0, 1_000_000)))),
-            Ok(row_event(row)),
+            Ok(rows_event(batch.flush().unwrap())),
             Ok(error_event("boom", 1, Some(ts.into()))),
             Ok(done_event(1, None, Duration::from_millis(7))),
         ];
@@ -292,8 +479,8 @@ mod tests {
         );
 
         let (fields, data) = frame(frames[1]);
-        assert_eq!(fields, vec![("event", "row"), ("id", ts)]);
-        assert_eq!(data, json!({ "price": 0.42, "size": 3 }));
+        assert_eq!(fields, vec![("event", "rows"), ("id", ts)]);
+        assert_eq!(data, json!([[0.41, 2], [0.42, 3]]));
 
         let (fields, data) = frame(frames[2]);
         assert_eq!(fields, vec![("event", "error")]);

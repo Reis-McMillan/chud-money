@@ -48,7 +48,6 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::{Stream, TryStreamExt};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use serde::Serialize;
-use serde_json::{Number, Value};
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -696,11 +695,16 @@ impl Questdb {
                 let rows = client.simple_query_raw(&sql).await?;
                 let mut rows = std::pin::pin!(rows);
                 let mut n = 0usize;
+                let mut buf = Vec::new();
                 while let Some(msg) = rows.try_next().await? {
                     if let SimpleQueryMessage::Row(r) = msg {
                         n += 1;
                         let ts = r.get(cols.len() - 1).unwrap_or_default().to_string();
-                        yield DataRow { ts, json: row_json(cols, |i| r.get(i)) };
+                        buf.clear();
+                        encode_row(cols, |i| r.get(i), &mut buf);
+                        // `encode_row` only writes serde_json output, which is UTF-8.
+                        let json = String::from_utf8(buf.clone()).expect("encode_row writes UTF-8");
+                        yield DataRow { ts, json };
                     }
                 }
                 cursor = hi;
@@ -793,11 +797,12 @@ impl Questdb {
 }
 
 /// One exported row: its `ts` as QuestDB prints it (RFC3339, microseconds)
-/// and every column as a JSON object.
+/// and every column as the text of a compact JSON array in `DataTable::columns`
+/// order, as `encode_row` writes it.
 #[derive(Debug, Clone)]
 pub struct DataRow {
     pub ts: String,
-    pub json: Value,
+    pub json: String,
 }
 
 pub type DataStream = Pin<Box<dyn Stream<Item = Result<DataRow, tokio_postgres::Error>> + Send>>;
@@ -853,22 +858,34 @@ fn window_sql(table: DataTable, key: &str, start_us: i64, end_us: i64) -> String
     )
 }
 
-/// A simple-query row as a JSON object: `get(i)` is column `i`'s text, or
-/// `None` for SQL NULL. Numbers become JSON numbers (a non-finite double
-/// becomes null), everything else a string.
-fn row_json<'a>(cols: &[Column], get: impl Fn(usize) -> Option<&'a str>) -> Value {
-    let fields = cols.iter().enumerate().map(|(i, c)| {
-        let value = match (get(i), c.kind) {
-            (None, _) => Value::Null,
-            (Some(s), ColKind::Double) => {
-                s.parse::<f64>().ok().and_then(Number::from_f64).map_or(Value::Null, Value::Number)
-            }
-            (Some(s), ColKind::Long) => s.parse::<i64>().ok().map_or(Value::Null, Value::from),
-            (Some(s), ColKind::Text | ColKind::Timestamp) => Value::String(s.to_string()),
-        };
-        (c.name.to_string(), value)
-    });
-    Value::Object(fields.collect())
+/// Appends a simple-query row to `out` as a compact JSON array, one value per
+/// column in `cols` order: `get(i)` is column `i`'s text, or `None` for SQL
+/// NULL. Numbers become JSON numbers (a non-finite or unparsable one becomes
+/// null), everything else a string. Written straight into the buffer rather
+/// than through a `serde_json::Value`, which would allocate per column on a
+/// path that runs tens of millions of times per export.
+fn encode_row<'a>(cols: &[Column], get: impl Fn(usize) -> Option<&'a str>, out: &mut Vec<u8>) {
+    out.push(b'[');
+    for (i, c) in cols.iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        // Writing to a Vec cannot fail, hence the ignored results.
+        match (get(i), c.kind) {
+            (None, _) => out.extend_from_slice(b"null"),
+            // `to_writer` prints a non-finite f64 as null itself.
+            (Some(s), ColKind::Double) => match s.parse::<f64>() {
+                Ok(d) => _ = serde_json::to_writer(&mut *out, &d),
+                Err(_) => out.extend_from_slice(b"null"),
+            },
+            (Some(s), ColKind::Long) => match s.parse::<i64>() {
+                Ok(l) => _ = serde_json::to_writer(&mut *out, &l),
+                Err(_) => out.extend_from_slice(b"null"),
+            },
+            (Some(s), ColKind::Text | ColKind::Timestamp) => _ = serde_json::to_writer(&mut *out, s),
+        }
+    }
+    out.push(b']');
 }
 
 /// `ms` as a timestamp literal QuestDB compares against `ts`.
@@ -1068,6 +1085,7 @@ fn start_ilp_writer(conf: String, mut rx: mpsc::Receiver<Row>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     fn row() -> Row {
         Row::Index(IndexRow {
@@ -1189,13 +1207,11 @@ mod tests {
         assert!(rows.windows(2).all(|w| w[0].ts < w[1].ts), "rows out of order");
         assert_eq!(
             rows[0].json,
-            serde_json::json!({
-                "index_id": "ZZTEST", "source": "test", "value": 0.0,
-                "received_at": "2023-11-14T22:13:20.005000Z", "ts": "2023-11-14T22:13:20.000000Z"
-            })
+            r#"["ZZTEST","test",0.0,"2023-11-14T22:13:20.005000Z","2023-11-14T22:13:20.000000Z"]"#
         );
-        assert_eq!(rows[1].json["received_at"], Value::Null);
-        assert_eq!(rows[1].json["value"], serde_json::json!(1.0));
+        let row1: Value = serde_json::from_str(&rows[1].json).unwrap();
+        assert_eq!(row1[3], Value::Null);
+        assert_eq!(row1[2], serde_json::json!(1.0));
 
         // A sub-range is half-open on both ends.
         let stream = db
@@ -1291,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn row_json_types_values() {
+    fn encode_row_types_values() {
         let cols = [
             col("s", ColKind::Text),
             col("d", ColKind::Double),
@@ -1300,6 +1316,7 @@ mod tests {
             col("n", ColKind::Double),
             col("nan", ColKind::Double),
             col("bad", ColKind::Long),
+            col("q", ColKind::Text),
         ];
         let values = [
             Some("BTC-USD"),
@@ -1309,14 +1326,26 @@ mod tests {
             None,
             Some("NaN"),
             Some("x"),
+            Some("say \"hi\"\nbye"),
         ];
-        let json = row_json(&cols, |i| values[i]);
+        let mut buf = b"junk".to_vec();
+        buf.clear();
+        encode_row(&cols, |i| values[i], &mut buf);
+        let json = String::from_utf8(buf).unwrap();
+        // Compact, one line, so it fits in a single SSE `data:` field.
+        assert_eq!(json, r#"["BTC-USD",0.42,-7,"2026-09-24T00:00:00.000001Z",null,null,null,"say \"hi\"\nbye"]"#);
         assert_eq!(
-            json,
-            serde_json::json!({
-                "s": "BTC-USD", "d": 0.42, "l": -7, "t": "2026-09-24T00:00:00.000001Z",
-                "n": null, "nan": null, "bad": null
-            })
+            serde_json::from_str::<Value>(&json).unwrap(),
+            serde_json::json!([
+                "BTC-USD",
+                0.42,
+                -7,
+                "2026-09-24T00:00:00.000001Z",
+                null,
+                null,
+                null,
+                "say \"hi\"\nbye"
+            ])
         );
     }
 }
