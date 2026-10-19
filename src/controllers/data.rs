@@ -31,12 +31,14 @@
 //! The export is not a consistent snapshot: `end` defaults to the last row
 //! at request time, and a late out-of-order write into a window already
 //! streamed is missed. The book tables run to tens of millions of rows, so
-//! at most `DATA_STREAMS` exports run at once (429 beyond that) and each is
-//! pulled from QuestDB one bounded window at a time; see
-//! `Questdb::stream_data`.
+//! at most `USER_STREAMS` exports per user and `DATA_STREAMS` process-wide
+//! run at once (429 beyond either) and each is pulled from QuestDB one
+//! bounded window at a time; see `Questdb::stream_data`.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, Query, State};
@@ -47,7 +49,7 @@ use futures_util::{Stream, StreamExt, stream};
 use mongodb::bson::doc;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db::questdb::{DataRow, DataStream, DataTable, KeySource};
 use crate::error::AppError;
@@ -56,9 +58,12 @@ use crate::model::Model;
 use crate::model::market::Market;
 use crate::state::AppState;
 
-/// Concurrent exports allowed process-wide. Each pins a PGWire connection and
-/// a stream of scans on a two-worker, CPU-bound QuestDB.
-pub const DATA_STREAMS: usize = 2;
+/// Concurrent exports one user may run at once.
+pub const USER_STREAMS: usize = 10;
+
+/// Concurrent exports allowed process-wide, across all users. Each pins a
+/// PGWire connection and a stream of scans on a CPU-bound QuestDB.
+pub const DATA_STREAMS: usize = 20;
 
 /// Reconnect delay asked of `EventSource`, so a client that ignores `done`
 /// does not hammer the endpoint.
@@ -82,6 +87,84 @@ pub struct BatchLimits {
 impl Default for BatchLimits {
     fn default() -> Self {
         BatchLimits { rows: BATCH_ROWS, bytes: BATCH_BYTES }
+    }
+}
+
+/// Caps concurrent exports at `user_cap` per user and `global_cap` in total.
+pub struct StreamLimits {
+    user_cap: usize,
+    global_cap: usize,
+    global: Arc<Semaphore>,
+    per_user: Mutex<HashMap<String, usize>>,
+}
+
+/// One running export's share of a `StreamLimits`, released on drop.
+pub struct StreamSlot {
+    _global: OwnedSemaphorePermit,
+    user: String,
+    limits: Arc<StreamLimits>,
+}
+
+impl StreamLimits {
+    pub fn new(user_cap: usize, global_cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            user_cap,
+            global_cap,
+            global: Arc::new(Semaphore::new(global_cap)),
+            per_user: Mutex::default(),
+        })
+    }
+
+    /// A slot for `user`, or 429. The per-user cap is checked first so a
+    /// user at their own limit is told so rather than blamed on load.
+    pub fn acquire(self: &Arc<Self>, user: &str) -> Result<StreamSlot, AppError> {
+        {
+            let mut per_user = self.lock();
+            let count = per_user.get(user).copied().unwrap_or(0);
+            if count >= self.user_cap {
+                let cap = self.user_cap;
+                return Err(AppError::TooManyRequests(format!("at most {cap} data streams may run at once per user")));
+            }
+            per_user.insert(user.to_string(), count + 1);
+        }
+        match self.global.clone().try_acquire_owned() {
+            Ok(permit) => Ok(StreamSlot { _global: permit, user: user.to_string(), limits: Arc::clone(self) }),
+            Err(_) => {
+                self.release(user);
+                let cap = self.global_cap;
+                Err(AppError::TooManyRequests(format!("at most {cap} data streams may run at once")))
+            }
+        }
+    }
+
+    /// The map holds only users with a running export, so it cannot grow
+    /// with every user ever seen.
+    fn release(&self, user: &str) {
+        let mut per_user = self.lock();
+        if let Some(count) = per_user.get_mut(user) {
+            *count -= 1;
+            if *count == 0 {
+                per_user.remove(user);
+            }
+        }
+    }
+
+    /// `std::sync::Mutex` because `StreamSlot::drop` cannot await; the
+    /// critical section is one map lookup. Nothing panics while holding it,
+    /// so a poisoned lock is still consistent.
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, usize>> {
+        self.per_user.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    fn users(&self) -> usize {
+        self.lock().len()
+    }
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        self.limits.release(&self.user);
     }
 }
 
@@ -123,11 +206,7 @@ pub async fn stream(
     if let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(parse_ts) {
         start = Some(id);
     }
-    let permit = state
-        .data_streams
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| AppError::TooManyRequests(format!("at most {DATA_STREAMS} data streams may run at once")))?;
+    let slot = state.data_streams.acquire(&user.id)?;
 
     // Clip the request to what the table holds so an open-ended range does
     // not walk empty windows back to 1970 or forward past the last row.
@@ -146,7 +225,7 @@ pub async fn stream(
     };
     tracing::info!(%tag, table = table.name(), user = %user.id, start_us, end_us, "data stream opened");
     let rows = state.questdb.stream_data(table, key.clone(), start_us, end_us).await?;
-    Ok(sse(Box::pin(events(table, key, (start_us, end_us), rows, permit, BatchLimits::default()))))
+    Ok(sse(Box::pin(events(table, key, (start_us, end_us), rows, slot, BatchLimits::default()))))
 }
 
 fn sse(events: EventStream) -> SseResponse {
@@ -154,17 +233,17 @@ fn sse(events: EventStream) -> SseResponse {
 }
 
 /// `meta`, the rows in `rows` batches, then `done` or `error`. Holds the
-/// concurrency permit for as long as the client keeps reading.
+/// concurrency slot for as long as the client keeps reading.
 fn events(
     table: DataTable,
     key: String,
     range: (i64, i64),
     rows: DataStream,
-    permit: OwnedSemaphorePermit,
+    slot: StreamSlot,
     limits: BatchLimits,
 ) -> impl Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
-        let _permit = permit;
+        let _slot = slot;
         let started = Instant::now();
         yield Ok(meta_event(table, &key, Some(range)));
         let mut rows = std::pin::pin!(rows);
@@ -331,8 +410,35 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use std::sync::Arc;
-    use tokio::sync::Semaphore;
+
+    #[test]
+    fn stream_limits_cap_per_user_and_in_total() {
+        let limits = StreamLimits::new(2, 3);
+        let a1 = limits.acquire("a").unwrap();
+        let a2 = limits.acquire("a").unwrap();
+        match limits.acquire("a") {
+            Err(AppError::TooManyRequests(m)) => assert!(m.contains("per user"), "{m}"),
+            Err(other) => panic!("expected per-user 429, got {other:?}"),
+            Ok(_) => panic!("third stream for one user should be refused"),
+        }
+        let b1 = limits.acquire("b").unwrap();
+        match limits.acquire("b") {
+            Err(AppError::TooManyRequests(m)) => assert!(!m.contains("per user"), "{m}"),
+            Err(other) => panic!("expected global 429, got {other:?}"),
+            Ok(_) => panic!("fourth stream overall should be refused"),
+        }
+        // A refusal at the global cap leaves no trace of the user.
+        assert!(limits.acquire("c").is_err());
+        assert_eq!(limits.users(), 2);
+
+        drop(a1);
+        let a3 = limits.acquire("a").unwrap();
+        drop(a2);
+        drop(a3);
+        assert_eq!(limits.users(), 1);
+        drop(b1);
+        assert_eq!(limits.users(), 0);
+    }
 
     #[test]
     fn range_parsing() {
@@ -372,9 +478,9 @@ mod tests {
         rows: Vec<Result<DataRow, tokio_postgres::Error>>,
         limits: BatchLimits,
     ) -> Vec<(Vec<(String, String)>, Value)> {
-        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        let slot = StreamLimits::new(1, 1).acquire("t").unwrap();
         let events =
-            events(DataTable::ContractBookLive, "K".into(), (0, 1), Box::pin(stream::iter(rows)), permit, limits);
+            events(DataTable::ContractBookLive, "K".into(), (0, 1), Box::pin(stream::iter(rows)), slot, limits);
         let res = Sse::new(events).into_response();
         let body = String::from_utf8(to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
         body.strip_suffix("\n\n")

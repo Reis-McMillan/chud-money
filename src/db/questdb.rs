@@ -53,7 +53,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 /// Rows queued for the writer before producers see backpressure.
 const ILP_QUEUE: usize = 50_000;
@@ -591,24 +591,72 @@ pub struct TableSummary {
     pub last_ts: Option<String>,
 }
 
-/// One table plus the symbol column and value that select a market's rows.
+/// One table plus the value of its key column that selects a market's rows.
 #[derive(Debug, Clone, Copy)]
 pub struct SummaryKey<'a> {
-    pub table: &'static str,
-    pub column: &'static str,
+    pub table: DataTable,
     pub key: &'a str,
 }
 
-/// The one statement behind [`Questdb::summaries`]. `count()` is the cost (a
-/// filtered scan); `min`/`max` of the designated timestamp ride along in the
-/// same pass, so one query beats three.
-fn summary_sql(key: SummaryKey<'_>) -> String {
+/// A [`TableSummary`] under construction for one key, carried across
+/// refreshes by `feeds::summary`: every row with `ts < next_us` has been
+/// counted. `next_us` is `None` before the first window.
+#[derive(Debug, Clone, Default)]
+pub struct SummaryProgress {
+    rows: i64,
+    first_ts: Option<String>,
+    last_ts: Option<String>,
+    next_us: Option<i64>,
+}
+
+impl SummaryProgress {
+    fn summary(&self, table: DataTable) -> TableSummary {
+        TableSummary {
+            table: table.name(),
+            rows: self.rows,
+            first_ts: self.first_ts.clone(),
+            last_ts: self.last_ts.clone(),
+        }
+    }
+}
+
+/// The one statement behind [`Questdb::advance_summaries`]: the key's rows
+/// with `ts` in `[start_us, end_us)`. `count()` is the cost (a filtered scan
+/// of the partitions the window touches); `min`/`max` of the designated
+/// timestamp ride along in the same pass, so one query beats three.
+fn summary_sql(key: SummaryKey<'_>, start_us: i64, end_us: i64) -> String {
     let value = key.key.replace('\'', "''");
     format!(
         "SELECT count() AS rows, cast(min(ts) AS string) AS first_ts, cast(max(ts) AS string) AS last_ts \
-         FROM {} WHERE {} = '{value}'",
-        key.table, key.column
+         FROM {} WHERE {} = '{value}' AND ts >= '{}' AND ts < '{}'",
+        key.table.name(),
+        key.table.key_column(),
+        ts_literal_us(start_us),
+        ts_literal_us(end_us),
     )
+}
+
+/// The window starting at `cursor`: up to the next UTC day boundary, so one
+/// query reads one `PARTITION BY DAY` partition, clipped to `end_us`; `None`
+/// once the range is exhausted.
+fn next_day_window(cursor: i64, end_us: i64) -> Option<(i64, i64)> {
+    const DAY: i64 = 24 * 3_600 * 1_000_000;
+    (cursor < end_us).then(|| (cursor, (cursor.div_euclid(DAY) + 1).saturating_mul(DAY).min(end_us)))
+}
+
+/// The first data row of a simple-query response, if any.
+fn first_row(messages: Vec<SimpleQueryMessage>) -> Option<SimpleQueryRow> {
+    messages.into_iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(r) => Some(r),
+        _ => None,
+    })
+}
+
+/// See [`Questdb::data_bounds`].
+async fn bounds(client: &Client, table: DataTable) -> Result<Option<(i64, i64)>, tokio_postgres::Error> {
+    let sql = format!("SELECT cast(min(ts) AS long), cast(max(ts) AS long) FROM {}", table.name());
+    let row = first_row(client.simple_query(&sql).await?);
+    Ok(row.and_then(|r| Some((r.get(0)?.parse().ok()?, r.get(1)?.parse().ok()?))))
 }
 
 #[derive(Clone)]
@@ -652,13 +700,7 @@ impl Questdb {
     /// come from partition metadata in well under a second, while a key
     /// filter would make them a scan of the whole table.
     pub async fn data_bounds(&self, table: DataTable) -> Result<Option<(i64, i64)>, tokio_postgres::Error> {
-        let client = self.pg().await?;
-        let sql = format!("SELECT cast(min(ts) AS long), cast(max(ts) AS long) FROM {}", table.name());
-        let row = client.simple_query(&sql).await?.into_iter().find_map(|m| match m {
-            SimpleQueryMessage::Row(r) => Some(r),
-            _ => None,
-        });
-        Ok(row.and_then(|r| Some((r.get(0)?.parse().ok()?, r.get(1)?.parse().ok()?))))
+        bounds(&self.pg().await?, table).await
     }
 
     /// Every row of `table` for `key` with `ts` in `[start_us, end_us)`, in
@@ -713,7 +755,19 @@ impl Questdb {
         }))
     }
 
-    /// Counts and time spans for `keys`, one summary each, in order.
+    /// Counts and time spans for `keys`, one summary each, in order, brought
+    /// up to each table's current last row by advancing `progress` (one entry
+    /// per key, zeroed at startup and kept by the caller between calls).
+    ///
+    /// Only rows past the key's cursor are counted, in windows of at most one
+    /// day partition each, so no single query grows with the table: a full
+    /// `count()` of `contract_book_live` had passed QuestDB's 60 s query
+    /// timeout. The first call walks the whole history; later ones count
+    /// what arrived since. The upper bound is the table's unfiltered
+    /// `max(ts)` (partition metadata, cheap) plus one microsecond, which
+    /// becomes the next cursor. A row that lands later with an earlier `ts`
+    /// is therefore never counted; the live feeds write in order, so that is
+    /// confined to out-of-order sources such as a historical backfill.
     ///
     /// Uses the simple query protocol with the key inlined: QuestDB's PGWire
     /// has known issues binding parameters, and every key is schema-validated
@@ -723,23 +777,36 @@ impl Questdb {
     ///
     /// The queries run sequentially on one connection: each is a filtered
     /// scan of a table the ILP writer is also busy on, so issuing them
-    /// concurrently only lengthens them all. Fails on the first error so
-    /// callers keep their previous snapshot.
-    pub async fn summaries(&self, keys: &[SummaryKey<'_>]) -> Result<Vec<TableSummary>, tokio_postgres::Error> {
+    /// concurrently only lengthens them all. Fails on the first error;
+    /// `progress` keeps every window counted so far, so a failed or cancelled
+    /// call resumes rather than restarts.
+    pub async fn advance_summaries(
+        &self,
+        keys: &[SummaryKey<'_>],
+        progress: &mut [SummaryProgress],
+    ) -> Result<Vec<TableSummary>, tokio_postgres::Error> {
+        assert_eq!(keys.len(), progress.len(), "one SummaryProgress per key");
         let client = self.pg().await?;
         let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            let row = client.simple_query(&summary_sql(*key)).await?.into_iter().find_map(|m| match m {
-                SimpleQueryMessage::Row(r) => Some(r),
-                _ => None,
-            });
-            let col = |i: usize| -> Option<String> { row.as_ref().and_then(|r| r.get(i)).map(str::to_string) };
-            out.push(TableSummary {
-                table: key.table,
-                rows: col(0).and_then(|s| s.parse().ok()).unwrap_or(0),
-                first_ts: col(1),
-                last_ts: col(2),
-            });
+        for (key, p) in keys.iter().zip(progress.iter_mut()) {
+            if let Some((min_us, max_us)) = bounds(&client, key.table).await? {
+                let end_us = max_us + 1;
+                let mut cursor = p.next_us.unwrap_or(min_us);
+                while let Some((lo, hi)) = next_day_window(cursor, end_us) {
+                    let row = first_row(client.simple_query(&summary_sql(*key, lo, hi)).await?);
+                    let col = |i: usize| row.as_ref().and_then(|r| r.get(i)).map(str::to_string);
+                    p.rows += col(0).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    if p.first_ts.is_none() {
+                        p.first_ts = col(1);
+                    }
+                    if let Some(last) = col(2) {
+                        p.last_ts = Some(last);
+                    }
+                    p.next_us = Some(hi);
+                    cursor = hi;
+                }
+            }
+            out.push(p.summary(key.table));
         }
         Ok(out)
     }
@@ -747,7 +814,7 @@ impl Questdb {
     /// Rows `index_values_hist` already holds for one index within
     /// `[start_ms, end_ms)`, counted per calendar-aligned `sample_by` bucket
     /// (a QuestDB interval such as `1h`) and keyed by bucket start in ms.
-    /// See `summaries` for why the id is inlined.
+    /// See `advance_summaries` for why the id is inlined.
     pub async fn index_counts(
         &self,
         index_id: &str,
@@ -837,7 +904,7 @@ fn next_size(size_us: i64, rows: usize) -> i64 {
 /// One window's query: every column by name (timestamps pre-formatted by
 /// QuestDB so they arrive as RFC3339 text), ordered by the designated
 /// timestamp, which is free. `key` comes from a schema-validated market
-/// document, never from the client; see `summaries` for the inlining.
+/// document, never from the client; see `advance_summaries` for the inlining.
 fn window_sql(table: DataTable, key: &str, start_us: i64, end_us: i64) -> String {
     let cols = table
         .columns()
@@ -1099,17 +1166,32 @@ mod tests {
     }
 
     #[test]
-    fn summary_sql_escapes_and_targets_the_key() {
-        let sql = summary_sql(SummaryKey { table: CONTRACT_BOOK_TABLE, column: "series_ticker", key: "KXBTC15M" });
-        assert!(sql.ends_with("FROM contract_book_live WHERE series_ticker = 'KXBTC15M'"), "{sql}");
+    fn summary_sql_escapes_and_targets_the_key_and_window() {
+        let sql = summary_sql(SummaryKey { table: DataTable::ContractBookLive, key: "KXBTC15M" }, 0, 1_000_000);
+        let tail = format!(
+            "FROM contract_book_live WHERE series_ticker = 'KXBTC15M' AND ts >= '{}' AND ts < '{}'",
+            ts_literal_us(0),
+            ts_literal_us(1_000_000)
+        );
+        assert!(sql.ends_with(&tail), "{sql}");
         for needed in ["count()", "min(ts)", "max(ts)"] {
             assert!(sql.contains(needed), "{sql}");
         }
         for gone in ["dateadd", "now()", "value"] {
             assert!(!sql.contains(gone), "{sql}");
         }
-        let sql = summary_sql(SummaryKey { table: "t", column: "c", key: "O'Brien" });
-        assert!(sql.ends_with("WHERE c = 'O''Brien'"), "{sql}");
+        let sql = summary_sql(SummaryKey { table: DataTable::CoinbaseBookLive, key: "O'Brien" }, 0, 1);
+        assert!(sql.contains("WHERE product = 'O''Brien' AND"), "{sql}");
+    }
+
+    #[test]
+    fn day_windows_align_to_partitions() {
+        const DAY: i64 = 24 * 3_600 * 1_000_000;
+        assert_eq!(next_day_window(0, 3 * DAY), Some((0, DAY)));
+        assert_eq!(next_day_window(DAY + 5, 3 * DAY), Some((DAY + 5, 2 * DAY)));
+        assert_eq!(next_day_window(2 * DAY + 1, 2 * DAY + 7), Some((2 * DAY + 1, 2 * DAY + 7)));
+        assert_eq!(next_day_window(DAY, DAY), None);
+        assert_eq!(next_day_window(-5, 1), Some((-5, 0)));
     }
 
     #[test]
@@ -1159,7 +1241,7 @@ mod tests {
     }
 
     /// End-to-end against a real QuestDB (`docker compose up -d questdb`):
-    /// ILP rows land, `summaries` counts them, and `stream_data` walks them
+    /// ILP rows land, `advance_summaries` counts them, and `stream_data` walks them
     /// back in order across several windows. Idempotent thanks to DEDUP.
     /// Run with `cargo test -- --ignored live_questdb`.
     #[tokio::test]
@@ -1181,10 +1263,11 @@ mod tests {
             db.ilp.send(row.into()).await.unwrap();
         }
 
-        let key = SummaryKey { table: Table::Live.name(), column: "index_id", key: "ZZTEST" };
+        let key = SummaryKey { table: DataTable::IndexValuesLive, key: "ZZTEST" };
+        let mut progress = vec![SummaryProgress::default()];
         let started = Instant::now();
         let summary = loop {
-            let s = db.summaries(&[key]).await.unwrap().remove(0);
+            let s = db.advance_summaries(&[key], &mut progress).await.unwrap().remove(0);
             if s.rows >= N {
                 break s;
             }

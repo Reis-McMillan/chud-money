@@ -2,11 +2,21 @@
 //!
 //! `GET /{tag}` used to run seven aggregates inline; against tens of millions
 //! of book rows that took tens of seconds and sometimes tripped QuestDB's
-//! query timeout. Instead one task per market recomputes the summaries every
-//! `REFRESH_INTERVAL` into `FeedShared::summary`, and the handler serves the
-//! last snapshot without touching QuestDB. Refreshes are serialized
-//! process-wide (each is a filtered scan competing with the ILP writer for
-//! the same CPU), so with N markets the effective period is
+//! query timeout. Instead one task per market maintains the summaries in
+//! `FeedShared::summary`, refreshed every `REFRESH_INTERVAL`, and the handler
+//! serves the last snapshot without touching QuestDB.
+//!
+//! Counting is incremental: each table's rows are counted once, in windows
+//! of at most a day, and a refresh counts only what landed after the previous
+//! one (see `Questdb::advance_summaries`). A full recount of the book table
+//! had outgrown QuestDB's 60 s query timeout. The first pass after a start
+//! walks the whole history a day at a time and may span several refreshes;
+//! the snapshot stays empty until it completes. Rows written behind the
+//! cursor afterwards (out-of-order feeds, historical backfills) are missed
+//! until the next restart.
+//!
+//! Refreshes are serialized process-wide (each competes with the ILP writer
+//! for the same CPU), so with N markets the effective period is
 //! `max(REFRESH_INTERVAL, N × refresh duration)`.
 
 use std::sync::Arc;
@@ -18,15 +28,14 @@ use tokio::sync::Semaphore;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use super::FeedShared;
-use crate::db::questdb::{
-    CANDLES_TABLE, COINBASE_BOOK_TABLE, COINBASE_TICKER_TABLE, CONTRACT_BOOK_TABLE, CONTRACT_TICKER_TABLE, SummaryKey,
-    Table, TableSummary,
-};
+use crate::db::questdb::{DataTable, SummaryKey, SummaryProgress, TableSummary};
 use crate::model::market::Market;
 use crate::state::AppState;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Guard against a wedged connection; QuestDB's own limit is 60 s per query.
+/// Progress made before the deadline is kept, so a long first pass resumes
+/// on the next tick rather than starting over.
 const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 /// One market's refresh at a time, whatever the number of markets.
 static REFRESH_SLOT: Semaphore = Semaphore::const_new(1);
@@ -61,22 +70,28 @@ fn summary_keys(market: &Market) -> Vec<SummaryKey<'_>> {
     let index = market.index_id.as_str();
     let series = market.series_ticker.as_str();
     let mut keys = vec![
-        SummaryKey { table: Table::Live.name(), column: "index_id", key: index },
-        SummaryKey { table: Table::Hist.name(), column: "index_id", key: index },
-        SummaryKey { table: CANDLES_TABLE, column: "series_ticker", key: series },
-        SummaryKey { table: CONTRACT_TICKER_TABLE, column: "series_ticker", key: series },
-        SummaryKey { table: CONTRACT_BOOK_TABLE, column: "series_ticker", key: series },
+        SummaryKey { table: DataTable::IndexValuesLive, key: index },
+        SummaryKey { table: DataTable::IndexValuesHist, key: index },
+        SummaryKey { table: DataTable::ContractCandlesHist, key: series },
+        SummaryKey { table: DataTable::ContractTickerLive, key: series },
+        SummaryKey { table: DataTable::ContractBookLive, key: series },
     ];
     if let Some(product) = market.coinbase_product.as_deref() {
-        keys.push(SummaryKey { table: COINBASE_TICKER_TABLE, column: "product", key: product });
-        keys.push(SummaryKey { table: COINBASE_BOOK_TABLE, column: "product", key: product });
+        keys.push(SummaryKey { table: DataTable::CoinbaseTickerLive, key: product });
+        keys.push(SummaryKey { table: DataTable::CoinbaseBookLive, key: product });
     }
     keys
 }
 
-async fn collect(state: &AppState, market: &Market) -> Result<QuestdbSummary, tokio_postgres::Error> {
+/// Brings `progress` (one entry per key of `summary_keys`, kept across
+/// refreshes) up to date and assembles the summary.
+async fn collect(
+    state: &AppState,
+    market: &Market,
+    progress: &mut [SummaryProgress],
+) -> Result<QuestdbSummary, tokio_postgres::Error> {
     let keys = summary_keys(market);
-    let mut it = state.questdb.summaries(&keys).await?.into_iter();
+    let mut it = state.questdb.advance_summaries(&keys, progress).await?.into_iter();
     // `summaries` returns exactly one entry per key, in order.
     let mut next = || it.next().unwrap_or_default();
     let has_product = market.coinbase_product.is_some();
@@ -95,13 +110,14 @@ async fn collect(state: &AppState, market: &Market) -> Result<QuestdbSummary, to
 /// A failed attempt keeps the previous tables and records the error.
 pub async fn run_summary_refresh(state: AppState, shared: Arc<FeedShared>) {
     let tag = shared.market.tag.as_str();
+    let mut progress = vec![SummaryProgress::default(); summary_keys(&shared.market).len()];
     let mut tick = interval(REFRESH_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let Ok(_slot) = REFRESH_SLOT.acquire().await else { return };
         let started = Instant::now();
-        let result = timeout(REFRESH_TIMEOUT, collect(&state, &shared.market)).await;
+        let result = timeout(REFRESH_TIMEOUT, collect(&state, &shared.market, &mut progress)).await;
         let elapsed_ms = started.elapsed().as_millis();
         let mut snap = shared.summary.write().await;
         match result {
@@ -112,14 +128,24 @@ pub async fn run_summary_refresh(state: AppState, shared: Arc<FeedShared>) {
                 tracing::info!(%tag, elapsed_ms, "summary refreshed");
             }
             Ok(Err(e)) => {
-                tracing::warn!(%tag, elapsed_ms, error = %e, "summary refresh failed");
-                snap.error = Some(e.to_string());
+                let error = describe(&e);
+                tracing::warn!(%tag, elapsed_ms, %error, "summary refresh failed");
+                snap.error = Some(error);
             }
             Err(_) => {
-                tracing::warn!(%tag, elapsed_ms, "summary refresh timed out");
+                tracing::warn!(%tag, elapsed_ms, "summary refresh timed out; progress kept");
                 snap.error = Some(format!("timed out after {REFRESH_TIMEOUT:?}"));
             }
         }
+    }
+}
+
+/// `tokio_postgres::Error` displays a server-side failure as just "db error";
+/// the message QuestDB sent (a query timeout, say) is in the source.
+fn describe(e: &tokio_postgres::Error) -> String {
+    match std::error::Error::source(e) {
+        Some(source) => format!("{e}: {source}"),
+        None => e.to_string(),
     }
 }
 
@@ -127,6 +153,7 @@ pub async fn run_summary_refresh(state: AppState, shared: Arc<FeedShared>) {
 mod tests {
     use super::*;
     use crate::config::KalshiEnv;
+    use crate::db::questdb::{CANDLES_TABLE, CONTRACT_BOOK_TABLE, CONTRACT_TICKER_TABLE, Table};
     use crate::model::market::{KalshiInfo, ProxyInfo};
     use serde_json::json;
 
@@ -183,13 +210,19 @@ mod tests {
         let keys = summary_keys(&without);
         assert_eq!(keys.len(), 5);
         assert!(keys.iter().all(|k| k.key == "BRTI" || k.key == "KXBTC15M"));
-        assert_eq!((keys[0].table, keys[0].column), ("index_values_live", "index_id"));
-        assert_eq!((keys[4].table, keys[4].column), ("contract_book_live", "series_ticker"));
+        assert_eq!((keys[0].table.name(), keys[0].table.key_column()), ("index_values_live", "index_id"));
+        assert_eq!((keys[4].table.name(), keys[4].table.key_column()), ("contract_book_live", "series_ticker"));
 
         let with = market(Some("BTC-USD"));
         let keys = summary_keys(&with);
         assert_eq!(keys.len(), 7);
-        assert_eq!((keys[5].table, keys[5].column, keys[5].key), ("coinbase_ticker_live", "product", "BTC-USD"));
-        assert_eq!((keys[6].table, keys[6].column, keys[6].key), ("coinbase_book_live", "product", "BTC-USD"));
+        assert_eq!(
+            (keys[5].table, keys[5].table.key_column(), keys[5].key),
+            (DataTable::CoinbaseTickerLive, "product", "BTC-USD")
+        );
+        assert_eq!(
+            (keys[6].table, keys[6].table.key_column(), keys[6].key),
+            (DataTable::CoinbaseBookLive, "product", "BTC-USD")
+        );
     }
 }

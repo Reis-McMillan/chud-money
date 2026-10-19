@@ -95,7 +95,10 @@ async fn main() -> Result<()> {
         feeds: Default::default(),
         ingest_jobs: Default::default(),
         verys_client,
-        data_streams: Arc::new(tokio::sync::Semaphore::new(controllers::data::DATA_STREAMS)),
+        data_streams: controllers::data::StreamLimits::new(
+            controllers::data::USER_STREAMS,
+            controllers::data::DATA_STREAMS,
+        ),
     };
 
     let markets = Market::all(&state.mongo).await?;
