@@ -66,6 +66,34 @@ pub struct Config {
     /// with it the Coinbase websocket subscribes with a JWT, without it the
     /// public channels are used unauthenticated.
     pub cdp_key: Option<(String, String)>,
+    /// Offload of old QuestDB partitions to GCS; `None` (no `GCS_BUCKET`)
+    /// disables it.
+    pub archive: Option<ArchiveConfig>,
+}
+
+/// See `crate::archive`.
+#[derive(Clone, Debug)]
+pub struct ArchiveConfig {
+    pub bucket: String,
+    /// Object key prefix inside the bucket, without slashes at either end;
+    /// may be empty.
+    pub prefix: String,
+    /// Days of data kept in QuestDB: a day is archived once it is at least
+    /// this many days before today (UTC).
+    pub after_days: u32,
+    /// QuestDB's HTTP endpoint (`/exp`), e.g. `http://localhost:9000`.
+    pub questdb_http_url: String,
+    pub questdb_user: String,
+    pub questdb_password: String,
+}
+
+/// `bucket` or `bucket/some/prefix` (an optional leading `gs://` is ignored).
+fn split_bucket(spec: &str) -> (String, String) {
+    let spec = spec.trim().trim_start_matches("gs://").trim_matches('/');
+    match spec.split_once('/') {
+        Some((bucket, prefix)) => (bucket.to_string(), prefix.trim_matches('/').to_string()),
+        None => (spec.to_string(), String::new()),
+    }
 }
 
 fn var_or(name: &str, default: &str) -> String {
@@ -100,6 +128,27 @@ impl Config {
             }
         };
 
+        let archive = match non_empty("GCS_BUCKET") {
+            Some(spec) => {
+                let (bucket, prefix) = split_bucket(&spec);
+                let after_days = var_or("ARCHIVE_AFTER_DAYS", "7");
+                let after_days: u32 =
+                    after_days.parse().with_context(|| format!("ARCHIVE_AFTER_DAYS={after_days:?} is not a number"))?;
+                anyhow::ensure!(after_days >= 1, "ARCHIVE_AFTER_DAYS must be at least 1: today is still being written");
+                Some(ArchiveConfig {
+                    bucket,
+                    prefix,
+                    after_days,
+                    questdb_http_url: var_or("QUESTDB_HTTP_URL", &format!("http://{pg_host}:9000"))
+                        .trim_end_matches('/')
+                        .to_string(),
+                    questdb_user: pg_user.clone(),
+                    questdb_password: pg_password.clone(),
+                })
+            }
+            None => None,
+        };
+
         Ok(Self {
             auth_url,
             verys_issuer,
@@ -118,6 +167,19 @@ impl Config {
                 .context("set KALSHI_API_KEY_ID to your Kalshi API key id")?,
             kalshi_key_path: var_or("KALSHI_PRIVATE_KEY_PATH", "kalshi_key.pem"),
             cdp_key,
+            archive,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_bucket_handles_prefix_scheme_and_slashes() {
+        assert_eq!(split_bucket("b"), ("b".into(), "".into()));
+        assert_eq!(split_bucket("gs://b/"), ("b".into(), "".into()));
+        assert_eq!(split_bucket("b/questdb/archive/"), ("b".into(), "questdb/archive".into()));
     }
 }

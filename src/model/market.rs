@@ -167,6 +167,7 @@ mod tests {
             kalshi_key_id: String::new(),
             kalshi_key_path: String::new(),
             cdp_key: None,
+            archive: None,
         }
     }
 

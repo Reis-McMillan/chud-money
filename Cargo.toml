@@ -19,9 +19,14 @@ jsonschema = { version = "0.54", default-features = false }
 # Same features as verys-rs-client so only one copy is built.
 jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 mongodb = "3.9"
+# GCS uploads for `archive`. Uses reqwest 0.13, which verys-rs-client already
+# pulls in.
+object_store = { version = "0.14", features = ["gcp"] }
+# Footer-only: `archive` reads the row count of the files QuestDB exports.
+parquet = { version = "60", default-features = false }
 questdb-rs = "7.0"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rsa = { version = "0.9", features = ["sha2"] }
 # Only to pick the process-wide crypto provider in main: both `ring` (mongodb,
 # reqwest) and `aws-lc-rs` (reqwest via verys-rs-client, jsonwebtoken) end up
@@ -41,6 +46,8 @@ uuid = { version = "1", features = ["v4"] }
 verys-rs-client = "0.1.0"
 
 [dev-dependencies]
+# Builds the in-memory Parquet fixtures for the archive tests.
+bytes = "1"
 # Throwaway Ed25519 keys for token-verification tests; already in the
 # dependency graph as jsonwebtoken's backend.
 aws-lc-rs = "1"

@@ -7,6 +7,7 @@
 //!
 //! Configuration is read from the environment (see `.env.example`).
 
+mod archive;
 mod coinbase;
 mod config;
 mod controllers;
@@ -85,6 +86,15 @@ async fn main() -> Result<()> {
     mongo.ensure_indexes(&[Market::spec()]).await?;
 
     let questdb = Questdb::connect(&config.questdb_ilp_conf, config.questdb_pg_conninfo.clone()).await?;
+    // Not fatal: a bad GCS setup must not take ingestion down with it.
+    match &config.archive {
+        Some(archive) => {
+            if let Err(e) = archive::spawn(questdb.clone(), archive.clone()) {
+                tracing::error!(error = format!("{e:#}"), "questdb archive disabled: setup failed");
+            }
+        }
+        None => tracing::info!("GCS_BUCKET not set; questdb archive disabled"),
+    }
 
     let state = AppState {
         config: Arc::new(config),

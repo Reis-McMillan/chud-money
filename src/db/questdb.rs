@@ -44,7 +44,7 @@
 //! ones, each of which costs a dedup + O3 merge.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use futures_util::{Stream, TryStreamExt};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use serde::Serialize;
@@ -659,6 +659,16 @@ async fn bounds(client: &Client, table: DataTable) -> Result<Option<(i64, i64)>,
     Ok(row.and_then(|r| Some((r.get(0)?.parse().ok()?, r.get(1)?.parse().ok()?))))
 }
 
+/// A row of `wal_tables()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalStatus {
+    pub suspended: bool,
+    /// Last transaction applied to the table (visible to queries).
+    pub writer_txn: i64,
+    /// Last transaction committed to the WAL.
+    pub sequencer_txn: i64,
+}
+
 #[derive(Clone)]
 pub struct Questdb {
     pub ilp: mpsc::Sender<Row>,
@@ -701,6 +711,76 @@ impl Questdb {
     /// filter would make them a scan of the whole table.
     pub async fn data_bounds(&self, table: DataTable) -> Result<Option<(i64, i64)>, tokio_postgres::Error> {
         bounds(&self.pg().await?, table).await
+    }
+
+    /// The UTC days `table` holds a partition for, oldest first, read from
+    /// partition metadata rather than the rows. An O3 split of a day shows
+    /// up as an extra partition with the same day, so the list is
+    /// deduplicated.
+    pub async fn partition_days(&self, table: DataTable) -> Result<Vec<NaiveDate>, tokio_postgres::Error> {
+        let sql = format!(
+            "SELECT cast(minTimestamp AS long) FROM table_partitions('{}') WHERE minTimestamp IS NOT NULL",
+            table.name()
+        );
+        let mut days: Vec<NaiveDate> = self
+            .pg()
+            .await?
+            .simple_query(&sql)
+            .await?
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => r.get(0)?.parse::<i64>().ok(),
+                _ => None,
+            })
+            .filter_map(|us| Some(DateTime::<Utc>::from_timestamp_micros(us)?.date_naive()))
+            .collect();
+        days.sort_unstable();
+        days.dedup();
+        Ok(days)
+    }
+
+    /// Row count per hour of `day` (0..=23), ascending, empty hours left out.
+    pub async fn hour_counts(
+        &self,
+        table: DataTable,
+        day: NaiveDate,
+    ) -> Result<Vec<(u32, u64)>, tokio_postgres::Error> {
+        let (start_us, end_us) = day_bounds_us(day);
+        let sql = format!(
+            "SELECT hour(ts) h, count() c FROM {} WHERE ts >= '{}' AND ts < '{}' ORDER BY h",
+            table.name(),
+            ts_literal_us(start_us),
+            ts_literal_us(end_us),
+        );
+        let rows = self.pg().await?.simple_query(&sql).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => Some((r.get(0)?.parse().ok()?, r.get(1)?.parse().ok()?)),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// `table`'s WAL progress; `None` if QuestDB does not list it as a WAL
+    /// table.
+    pub async fn wal_status(&self, table: DataTable) -> Result<Option<WalStatus>, tokio_postgres::Error> {
+        let sql =
+            format!("SELECT suspended, writerTxn, sequencerTxn FROM wal_tables() WHERE name = '{}'", table.name());
+        let row = first_row(self.pg().await?.simple_query(&sql).await?);
+        Ok(row.and_then(|r| {
+            Some(WalStatus {
+                suspended: r.get(0)? == "true",
+                writer_txn: r.get(1)?.parse().ok()?,
+                sequencer_txn: r.get(2)?.parse().ok()?,
+            })
+        }))
+    }
+
+    /// Drops `table`'s partition for `day`. Irreversible.
+    pub async fn drop_day(&self, table: DataTable, day: NaiveDate) -> Result<(), tokio_postgres::Error> {
+        let sql = format!("ALTER TABLE {} DROP PARTITION LIST '{}'", table.name(), day.format("%Y-%m-%d"));
+        self.pg().await?.batch_execute(&sql).await
     }
 
     /// Every row of `table` for `key` with `ts` in `[start_us, end_us)`, in
@@ -960,8 +1040,15 @@ fn ts_literal(ms: i64) -> String {
     ts_literal_us(ms * 1_000)
 }
 
+/// `[start, end)` of UTC `day` in microseconds.
+pub fn day_bounds_us(day: NaiveDate) -> (i64, i64) {
+    const DAY: i64 = 24 * 3_600 * 1_000_000;
+    let start = day.and_time(NaiveTime::MIN).and_utc().timestamp_micros();
+    (start, start + DAY)
+}
+
 /// `us` (microseconds, `ts`'s own precision) as a timestamp literal.
-fn ts_literal_us(us: i64) -> String {
+pub fn ts_literal_us(us: i64) -> String {
     DateTime::<Utc>::from_timestamp_micros(us).unwrap_or_default().to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
