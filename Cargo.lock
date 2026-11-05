@@ -494,7 +494,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "uuid",
  "verys-rs-client",
 ]
 

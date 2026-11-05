@@ -11,7 +11,7 @@ use crate::config::{Config, KalshiEnv};
 use crate::kalshi::stream::{CHANNEL_CF_5HZ, CHANNEL_ORDERBOOK, CHANNEL_TICKER};
 
 /// Path segments that would collide with fixed routes if used as a tag.
-pub const RESERVED_TAGS: &[&str] = &["add", "auth", "ingest", "ws"];
+pub const RESERVED_TAGS: &[&str] = &["add", "auth", "ws"];
 
 /// Coinbase product ids are `BASE-QUOTE`, e.g. `BTC-USD`.
 pub const COINBASE_PRODUCT_PATTERN: &str = "^[A-Z0-9]+-[A-Z0-9]+$";
@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn reserved_tag_rejected() {
-        let m = Market::from_add(add("ingest"), &test_config());
+        let m = Market::from_add(add("auth"), &test_config());
         assert!(MARKET_SPEC.validate(&serde_json::to_value(&m).unwrap()).is_err());
     }
 

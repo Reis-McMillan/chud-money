@@ -104,7 +104,6 @@ async fn main() -> Result<()> {
         kalshi,
         coinbase_auth,
         feeds: Default::default(),
-        ingest_jobs: Default::default(),
         verys_client,
         data_streams: controllers::data::StreamLimits::new(
             controllers::data::USER_STREAMS,

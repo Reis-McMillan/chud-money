@@ -4,8 +4,6 @@
 //! - `GET  /healthz`             liveness/readiness probe (touches no dependency)
 //! - `GET  /auth/me`             🔒 the caller's identity
 //! - `POST /add`                 🔒 create a market and start its feed
-//! - `POST /ingest`              🔒 start a historical backfill job (`kind`: `index` or `contracts`)
-//! - `GET  /ingest/{job_id}`     backfill job status
 //! - `GET  /{tag}`               market document + feed status + cached QuestDB summary
 //! - `DELETE /{tag}`             🔒 stop the feed and delete the document
 //! - `GET  /{tag}/data/{table}`  🔒 stream a QuestDB table for one market as SSE (`?start=&end=`)
@@ -18,7 +16,6 @@
 
 pub mod auth;
 pub mod data;
-pub mod ingest;
 pub mod markets;
 pub mod ws;
 
@@ -41,7 +38,6 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/auth/me", get(auth::me))
         .route("/add", post(markets::add))
-        .route("/ingest", post(ingest::start))
         .route("/{tag}", delete(markets::remove))
         .route("/{tag}/data/{table}", get(data::stream))
         .route("/ws/{tag}/ticker", get(ws::ticker))
@@ -51,7 +47,6 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(markets::list))
         .route("/healthz", get(healthz))
-        .route("/ingest/{job_id}", get(ingest::status))
         .route("/{tag}", get(markets::show))
         .merge(protected)
         .layer(CorsLayer::permissive())
@@ -79,7 +74,7 @@ mod tests {
     }
 
     /// Same shape as `router`: a guarded `DELETE /{tag}` and `/{tag}/data/{table}`
-    /// merged into a router that already has `GET /{tag}` and `/ingest/{job_id}`.
+    /// merged into a router that already has `GET /{tag}`.
     /// axum panics at construction if it cannot merge the method routers or
     /// the captures conflict, so building it is the test. The websocket route
     /// shows the guard runs before any upgrade handling.
@@ -91,11 +86,7 @@ mod tests {
             .route("/{tag}/data/{table}", get(ok))
             .route("/ws/{tag}/ticker", get(ok))
             .route_layer(middleware::from_fn(deny));
-        let app: Router = Router::new()
-            .route("/", get(ok))
-            .route("/ingest/{job_id}", get(ok))
-            .route("/{tag}", get(ok))
-            .merge(protected);
+        let app: Router = Router::new().route("/", get(ok)).route("/{tag}", get(ok)).merge(protected);
 
         let call = |method: Method, uri: &'static str| {
             let app = app.clone();
@@ -111,7 +102,6 @@ mod tests {
         assert_eq!(call(Method::POST, "/add").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/ws/btc-15m/ticker").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/btc-15m/data/contract_book_live").await, StatusCode::UNAUTHORIZED);
-        assert_eq!(call(Method::GET, "/ingest/abc").await, StatusCode::OK);
         assert_eq!(call(Method::GET, "/").await, StatusCode::OK);
     }
 

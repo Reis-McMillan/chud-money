@@ -4,8 +4,8 @@
 //! for the market's key (`index_id`, `series_ticker`, `coinbase_product` or
 //! `coinbase_perp_product`, depending on the table) with `ts` in
 //! `[start, end)`, oldest first. `table` is a QuestDB table name or its alias
-//! (`index-live`, `index-hist`, `candles`, `ticker`, `book`,
-//! `coinbase-ticker`, `coinbase-book`, `perp-ticker`, `perp-book`); `start`
+//! (`index-live`, `ticker`, `book`, `coinbase-ticker`, `coinbase-book`,
+//! `perp-ticker`, `perp-book`); `start`
 //! and `end` are RFC3339 and default to the table's first and last row.
 //!
 //! Events, each with a JSON body:
@@ -72,7 +72,7 @@ const RETRY: Duration = Duration::from_secs(10);
 
 /// Rows per `rows` event, and the JSON size at which a batch is flushed
 /// early. The row cap bounds what a client parses per event; the byte cap
-/// keeps wide rows (candles are 20 columns) from making events of several
+/// keeps wide rows (the ticker tables are 16 columns) from making events of several
 /// hundred KB.
 pub const BATCH_ROWS: usize = 1_000;
 pub const BATCH_BYTES: usize = 64 * 1024;

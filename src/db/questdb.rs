@@ -1,16 +1,10 @@
 //! QuestDB: ILP/HTTP ingestion on a dedicated blocking thread, PGWire queries.
 //!
-//! Two tables with an identical column set hold index values from different
-//! sources: `index_values_live` (5Hz websocket) and `index_values_hist`
-//! (REST pass-through backfill). Both are DEDUP'd on `(ts, index_id)` so
-//! re-ingesting a window or overlapping after a reconnect is idempotent.
+//! Every table is a `*_live` table holding what the websocket feeds stream,
+//! DEDUP'd so overlapping after a reconnect is idempotent:
 //!
-//! `contract_candles_hist` holds the prices the contracts themselves traded
-//! at: one row per market ticker per candlestick period, DEDUP'd on
-//! `(ts, ticker)`.
-//!
-//! Six `*_live` tables hold what the websocket feeds stream:
-//!
+//! - `index_values_live`: the CF Benchmarks 5Hz index, DEDUP'd on
+//!   `(ts, index_id)`.
 //! - `contract_ticker_live`: Kalshi's `ticker` channel, one row per market
 //!   per change (last price, best yes bid/ask and sizes, volume, open
 //!   interest).
@@ -35,8 +29,9 @@
 //! for Coinbase level2, Coinbase's gateway) saw the frame. Prices are in
 //! dollars and sizes in contracts / base currency.
 //!
-//! An earlier `coinbase_candles_hist` table (REST candle backfill) is no
-//! longer written or created; drop it by hand if it is still around.
+//! The earlier REST backfill tables (`index_values_hist`,
+//! `contract_candles_hist`, `coinbase_candles_hist`) are no longer written or
+//! created; drop them by hand if they are still around.
 //!
 //! Queries go over PGWire on a fresh connection per call. The only per-market
 //! statistics exposed are row count and time span ([`Questdb::summaries`]):
@@ -52,7 +47,6 @@ use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use futures_util::{Stream, TryStreamExt};
 use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -71,25 +65,10 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 /// Poll gap while waiting out `FLUSH_INTERVAL` on a blocking thread.
 const DRAIN_POLL: Duration = Duration::from_millis(5);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Table {
-    Live,
-    Hist,
-}
-
-impl Table {
-    pub fn name(self) -> &'static str {
-        match self {
-            Table::Live => "index_values_live",
-            Table::Hist => "index_values_hist",
-        }
-    }
-}
+pub const INDEX_TABLE: &str = "index_values_live";
 
 #[derive(Debug, Clone)]
 pub struct IndexRow {
-    pub table: Table,
     pub index_id: String,
     pub value: f64,
     /// Designated timestamp: the upstream publication time.
@@ -99,7 +78,6 @@ pub struct IndexRow {
     pub source: &'static str,
 }
 
-pub const CANDLES_TABLE: &str = "contract_candles_hist";
 pub const CONTRACT_TICKER_TABLE: &str = "contract_ticker_live";
 pub const CONTRACT_BOOK_TABLE: &str = "contract_book_live";
 pub const COINBASE_TICKER_TABLE: &str = "coinbase_ticker_live";
@@ -137,10 +115,10 @@ impl CoinbaseMarket {
 /// market (see [`DataTable::key_source`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+// Variants mirror the QuestDB table names, which all end in `_live`.
+#[allow(clippy::enum_variant_names)]
 pub enum DataTable {
     IndexValuesLive,
-    IndexValuesHist,
-    ContractCandlesHist,
     ContractTickerLive,
     ContractBookLive,
     CoinbaseTickerLive,
@@ -183,28 +161,6 @@ const INDEX_COLUMNS: &[Column] = &[
     col("source", ColKind::Text),
     col("value", ColKind::Double),
     col("received_at", ColKind::Timestamp),
-    col("ts", ColKind::Timestamp),
-];
-const CANDLE_COLUMNS: &[Column] = &[
-    col("ticker", ColKind::Text),
-    col("series_ticker", ColKind::Text),
-    col("source", ColKind::Text),
-    col("floor_strike", ColKind::Double),
-    col("yes_bid_open", ColKind::Double),
-    col("yes_bid_high", ColKind::Double),
-    col("yes_bid_low", ColKind::Double),
-    col("yes_bid_close", ColKind::Double),
-    col("yes_ask_open", ColKind::Double),
-    col("yes_ask_high", ColKind::Double),
-    col("yes_ask_low", ColKind::Double),
-    col("yes_ask_close", ColKind::Double),
-    col("price_open", ColKind::Double),
-    col("price_high", ColKind::Double),
-    col("price_low", ColKind::Double),
-    col("price_close", ColKind::Double),
-    col("price_mean", ColKind::Double),
-    col("volume", ColKind::Double),
-    col("open_interest", ColKind::Double),
     col("ts", ColKind::Timestamp),
 ];
 const CONTRACT_TICKER_COLUMNS: &[Column] = &[
@@ -268,10 +224,8 @@ const COINBASE_BOOK_COLUMNS: &[Column] = &[
 ];
 
 impl DataTable {
-    pub const ALL: [DataTable; 9] = [
+    pub const ALL: [DataTable; 7] = [
         DataTable::IndexValuesLive,
-        DataTable::IndexValuesHist,
-        DataTable::ContractCandlesHist,
         DataTable::ContractTickerLive,
         DataTable::ContractBookLive,
         DataTable::CoinbaseTickerLive,
@@ -282,9 +236,7 @@ impl DataTable {
 
     pub fn name(self) -> &'static str {
         match self {
-            DataTable::IndexValuesLive => Table::Live.name(),
-            DataTable::IndexValuesHist => Table::Hist.name(),
-            DataTable::ContractCandlesHist => CANDLES_TABLE,
+            DataTable::IndexValuesLive => INDEX_TABLE,
             DataTable::ContractTickerLive => CONTRACT_TICKER_TABLE,
             DataTable::ContractBookLive => CONTRACT_BOOK_TABLE,
             DataTable::CoinbaseTickerLive => COINBASE_TICKER_TABLE,
@@ -298,8 +250,6 @@ impl DataTable {
     pub fn alias(self) -> &'static str {
         match self {
             DataTable::IndexValuesLive => "index-live",
-            DataTable::IndexValuesHist => "index-hist",
-            DataTable::ContractCandlesHist => "candles",
             DataTable::ContractTickerLive => "ticker",
             DataTable::ContractBookLive => "book",
             DataTable::CoinbaseTickerLive => "coinbase-ticker",
@@ -318,10 +268,8 @@ impl DataTable {
 
     pub fn key_source(self) -> KeySource {
         match self {
-            DataTable::IndexValuesLive | DataTable::IndexValuesHist => KeySource::IndexId,
-            DataTable::ContractCandlesHist | DataTable::ContractTickerLive | DataTable::ContractBookLive => {
-                KeySource::SeriesTicker
-            }
+            DataTable::IndexValuesLive => KeySource::IndexId,
+            DataTable::ContractTickerLive | DataTable::ContractBookLive => KeySource::SeriesTicker,
             DataTable::CoinbaseTickerLive | DataTable::CoinbaseBookLive => KeySource::CoinbaseProduct,
             DataTable::CoinbasePerpTickerLive | DataTable::CoinbasePerpBookLive => KeySource::CoinbasePerpProduct,
         }
@@ -338,8 +286,7 @@ impl DataTable {
 
     pub fn columns(self) -> &'static [Column] {
         match self {
-            DataTable::IndexValuesLive | DataTable::IndexValuesHist => INDEX_COLUMNS,
-            DataTable::ContractCandlesHist => CANDLE_COLUMNS,
+            DataTable::IndexValuesLive => INDEX_COLUMNS,
             DataTable::ContractTickerLive => CONTRACT_TICKER_COLUMNS,
             DataTable::ContractBookLive => CONTRACT_BOOK_COLUMNS,
             DataTable::CoinbaseTickerLive | DataTable::CoinbasePerpTickerLive => COINBASE_TICKER_COLUMNS,
@@ -350,30 +297,14 @@ impl DataTable {
     /// The `CREATE TABLE IF NOT EXISTS` statement `ensure_tables` runs.
     fn ddl(self) -> String {
         match self {
-            DataTable::IndexValuesLive | DataTable::IndexValuesHist => format!(
-                "CREATE TABLE IF NOT EXISTS {} (\
+            DataTable::IndexValuesLive => format!(
+                "CREATE TABLE IF NOT EXISTS {INDEX_TABLE} (\
                     index_id SYMBOL CAPACITY 256 CACHE INDEX, \
                     source SYMBOL, \
                     value DOUBLE, \
                     received_at TIMESTAMP, \
                     ts TIMESTAMP\
-                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, index_id);",
-                self.name()
-            ),
-            DataTable::ContractCandlesHist => format!(
-                "CREATE TABLE IF NOT EXISTS {CANDLES_TABLE} (\
-                    ticker SYMBOL CAPACITY 65536 CACHE INDEX, \
-                    series_ticker SYMBOL CAPACITY 256 CACHE, \
-                    source SYMBOL, \
-                    floor_strike DOUBLE, \
-                    yes_bid_open DOUBLE, yes_bid_high DOUBLE, yes_bid_low DOUBLE, yes_bid_close DOUBLE, \
-                    yes_ask_open DOUBLE, yes_ask_high DOUBLE, yes_ask_low DOUBLE, yes_ask_close DOUBLE, \
-                    price_open DOUBLE, price_high DOUBLE, price_low DOUBLE, price_close DOUBLE, \
-                    price_mean DOUBLE, \
-                    volume DOUBLE, \
-                    open_interest DOUBLE, \
-                    ts TIMESTAMP\
-                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, ticker);"
+                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, index_id);"
             ),
             DataTable::ContractTickerLive => format!(
                 "CREATE TABLE IF NOT EXISTS {CONTRACT_TICKER_TABLE} (\
@@ -439,36 +370,6 @@ impl DataTable {
             ),
         }
     }
-}
-
-/// Open/high/low/close of one quantity over a candlestick period, in dollars.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Ohlc {
-    pub open: Option<f64>,
-    pub high: Option<f64>,
-    pub low: Option<f64>,
-    pub close: Option<f64>,
-}
-
-/// One candlestick of one market (e.g. `KXBTC15M-26SEP181300-00`).
-#[derive(Debug, Clone)]
-pub struct CandleRow {
-    pub series_ticker: String,
-    pub ticker: String,
-    /// Settlement target of the market, repeated on every row so candles can
-    /// be compared against the index without a second lookup.
-    pub floor_strike: Option<f64>,
-    pub yes_bid: Ohlc,
-    pub yes_ask: Ohlc,
-    /// Trade prices; all `None` for a period without trades.
-    pub price: Ohlc,
-    /// Volume-weighted average trade price.
-    pub price_mean: Option<f64>,
-    pub volume: Option<f64>,
-    pub open_interest: Option<f64>,
-    /// Designated timestamp: the *end* of the period, as Kalshi reports it.
-    pub ts_ms: i64,
-    pub source: &'static str,
 }
 
 /// One Kalshi `ticker` frame of one market. Fields Kalshi left out stay NULL.
@@ -581,7 +482,6 @@ pub struct CoinbaseBookRow {
 #[derive(Debug, Clone)]
 pub enum Row {
     Index(IndexRow),
-    Candle(Box<CandleRow>),
     ContractTicker(Box<ContractTickerRow>),
     ContractBook(ContractBookRow),
     CoinbaseTicker(Box<CoinbaseTickerRow>),
@@ -591,12 +491,6 @@ pub enum Row {
 impl From<IndexRow> for Row {
     fn from(row: IndexRow) -> Self {
         Row::Index(row)
-    }
-}
-
-impl From<CandleRow> for Row {
-    fn from(row: CandleRow) -> Self {
-        Row::Candle(Box::new(row))
     }
 }
 
@@ -893,7 +787,7 @@ impl Questdb {
     /// `max(ts)` (partition metadata, cheap) plus one microsecond, which
     /// becomes the next cursor. A row that lands later with an earlier `ts`
     /// is therefore never counted; the live feeds write in order, so that is
-    /// confined to out-of-order sources such as a historical backfill.
+    /// confined to rows that land late out of order.
     ///
     /// Uses the simple query protocol with the key inlined: QuestDB's PGWire
     /// has known issues binding parameters, and every key is schema-validated
@@ -936,57 +830,6 @@ impl Questdb {
         }
         Ok(out)
     }
-
-    /// Rows `index_values_hist` already holds for one index within
-    /// `[start_ms, end_ms)`, counted per calendar-aligned `sample_by` bucket
-    /// (a QuestDB interval such as `1h`) and keyed by bucket start in ms.
-    /// See `advance_summaries` for why the id is inlined.
-    pub async fn index_counts(
-        &self,
-        index_id: &str,
-        start_ms: i64,
-        end_ms: i64,
-        sample_by: &str,
-    ) -> Result<HashMap<i64, i64>, tokio_postgres::Error> {
-        let client = self.pg().await?;
-        let id = index_id.replace('\'', "''");
-        let sql = format!(
-            "SELECT cast(ts AS long) AS bucket_us, count() AS rows \
-             FROM {} WHERE index_id = '{id}' AND ts >= '{}' AND ts < '{}' \
-             SAMPLE BY {sample_by} ALIGN TO CALENDAR",
-            Table::Hist.name(),
-            ts_literal(start_ms),
-            ts_literal(end_ms),
-        );
-        let counts = client.simple_query(&sql).await?.into_iter().filter_map(|m| match m {
-            SimpleQueryMessage::Row(r) => Some((r.get(0)?.parse::<i64>().ok()? / 1_000, r.get(1)?.parse().ok()?)),
-            _ => None,
-        });
-        Ok(counts.collect())
-    }
-
-    /// Candles `contract_candles_hist` already holds per market ticker of one
-    /// series, for periods ending within `[start_ms, end_ms]`.
-    pub async fn candle_counts(
-        &self,
-        series_ticker: &str,
-        start_ms: i64,
-        end_ms: i64,
-    ) -> Result<HashMap<String, i64>, tokio_postgres::Error> {
-        let client = self.pg().await?;
-        let series = series_ticker.replace('\'', "''");
-        let sql = format!(
-            "SELECT ticker, count() AS rows \
-             FROM {CANDLES_TABLE} WHERE series_ticker = '{series}' AND ts >= '{}' AND ts <= '{}'",
-            ts_literal(start_ms),
-            ts_literal(end_ms),
-        );
-        let counts = client.simple_query(&sql).await?.into_iter().filter_map(|m| match m {
-            SimpleQueryMessage::Row(r) => Some((r.get(0)?.to_string(), r.get(1)?.parse().ok()?)),
-            _ => None,
-        });
-        Ok(counts.collect())
-    }
 }
 
 /// One exported row: its `ts` as QuestDB prints it (RFC3339, microseconds)
@@ -1005,7 +848,7 @@ const WINDOW_START: i64 = 60 * 1_000_000;
 const WINDOW_MIN: i64 = 1_000_000;
 const WINDOW_MAX: i64 = 24 * 3_600 * 1_000_000;
 /// Rows a window aims for: about 2.5 minutes of `contract_book_live` at
-/// today's rate, or a day of candles.
+/// today's rate.
 const WINDOW_TARGET_ROWS: usize = 50_000;
 
 /// The half-open window starting at `cursor`, clipped to `end_us`; `None`
@@ -1081,11 +924,6 @@ fn encode_row<'a>(cols: &[Column], get: impl Fn(usize) -> Option<&'a str>, out: 
     out.push(b']');
 }
 
-/// `ms` as a timestamp literal QuestDB compares against `ts`.
-fn ts_literal(ms: i64) -> String {
-    ts_literal_us(ms * 1_000)
-}
-
 /// `[start, end)` of UTC `day` in microseconds.
 pub fn day_bounds_us(day: NaiveDate) -> (i64, i64) {
     const DAY: i64 = 24 * 3_600 * 1_000_000;
@@ -1101,7 +939,6 @@ pub fn ts_literal_us(us: i64) -> String {
 fn push(buf: &mut Buffer, row: &Row) -> questdb::Result<()> {
     match row {
         Row::Index(row) => push_index(buf, row),
-        Row::Candle(row) => push_candle(buf, row),
         Row::ContractTicker(row) => push_contract_ticker(buf, row),
         Row::ContractBook(row) => push_contract_book(buf, row),
         Row::CoinbaseTicker(row) => push_coinbase_ticker(buf, row),
@@ -1180,37 +1017,10 @@ fn push_coinbase_book(buf: &mut Buffer, row: &CoinbaseBookRow) -> questdb::Resul
     buf.at(TimestampNanos::new(row.ts_ns))
 }
 
-fn push_candle(buf: &mut Buffer, row: &CandleRow) -> questdb::Result<()> {
-    buf.table(CANDLES_TABLE)?
-        .symbol("ticker", row.ticker.as_str())?
-        .symbol("series_ticker", row.series_ticker.as_str())?
-        .symbol("source", row.source)?;
-    // Absent values are left out so the column stays NULL.
-    let mut columns = vec![
-        ("floor_strike", row.floor_strike),
-        ("price_mean", row.price_mean),
-        ("volume", row.volume),
-        ("open_interest", row.open_interest),
-    ];
-    for (names, ohlc) in [
-        (["yes_bid_open", "yes_bid_high", "yes_bid_low", "yes_bid_close"], row.yes_bid),
-        (["yes_ask_open", "yes_ask_high", "yes_ask_low", "yes_ask_close"], row.yes_ask),
-        (["price_open", "price_high", "price_low", "price_close"], row.price),
-    ] {
-        columns.extend(names.into_iter().zip([ohlc.open, ohlc.high, ohlc.low, ohlc.close]));
-    }
-    for (name, value) in columns {
-        if let Some(value) = value {
-            buf.column_f64(name, value)?;
-        }
-    }
-    buf.at(TimestampNanos::new(row.ts_ms * 1_000_000))
-}
-
 fn push_index(buf: &mut Buffer, row: &IndexRow) -> questdb::Result<()> {
     // Symbols must precede regular columns in a row.
     let b = buf
-        .table(row.table.name())?
+        .table(INDEX_TABLE)?
         .symbol("index_id", row.index_id.as_str())?
         .symbol("source", row.source)?
         .column_f64("value", row.value)?;
@@ -1288,14 +1098,7 @@ mod tests {
     use serde_json::Value;
 
     fn row() -> Row {
-        Row::Index(IndexRow {
-            table: Table::Live,
-            index_id: "BRTI".into(),
-            value: 1.0,
-            ts_ms: 0,
-            received_at_ms: None,
-            source: "t",
-        })
+        Row::Index(IndexRow { index_id: "BRTI".into(), value: 1.0, ts_ms: 0, received_at_ms: None, source: "t" })
     }
 
     #[test]
@@ -1386,7 +1189,6 @@ mod tests {
         let base_ms: i64 = 1_700_000_000_000; // 2023-11-14T22:13:20Z
         for i in 0..N {
             let row = IndexRow {
-                table: Table::Live,
                 index_id: "ZZTEST".into(),
                 value: i as f64,
                 ts_ms: base_ms + i * 1_000,
@@ -1462,8 +1264,8 @@ mod tests {
         assert_eq!(DataTable::parse("index_values_live"), Some(DataTable::IndexValuesLive));
         assert_eq!(DataTable::parse("orders"), None);
         assert_eq!(DataTable::parse(""), None);
-        assert_eq!(DataTable::IndexValuesHist.key_column(), "index_id");
-        assert_eq!(DataTable::ContractCandlesHist.key_column(), "series_ticker");
+        assert_eq!(DataTable::IndexValuesLive.key_column(), "index_id");
+        assert_eq!(DataTable::ContractTickerLive.key_column(), "series_ticker");
         assert_eq!(DataTable::CoinbaseTickerLive.key_column(), "product");
         assert_eq!(DataTable::CoinbasePerpBookLive.key_source(), KeySource::CoinbasePerpProduct);
         assert_eq!(DataTable::CoinbasePerpBookLive.key_column(), "product");

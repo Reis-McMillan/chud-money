@@ -7,7 +7,6 @@ use verys_rs_client::VerysClient;
 use crate::coinbase::auth::Auth as CoinbaseAuth;
 use crate::config::Config;
 use crate::controllers::data::StreamLimits;
-use crate::controllers::ingest::IngestJobs;
 use crate::db::mongo::Mongo;
 use crate::db::questdb::Questdb;
 use crate::feeds::FeedRegistry;
@@ -23,7 +22,6 @@ pub struct AppState {
     /// configured, in which case the public channels are used unauthenticated.
     pub coinbase_auth: Option<Arc<CoinbaseAuth>>,
     pub feeds: FeedRegistry,
-    pub ingest_jobs: IngestJobs,
     /// Used only to fetch and cache the Verys signing key (JWKS).
     pub verys_client: Arc<VerysClient>,
     /// Caps concurrent `GET /{tag}/data/{table}` exports per user and in

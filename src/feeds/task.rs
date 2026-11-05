@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use super::FeedShared;
-use crate::db::questdb::{BookKind, ContractBookRow, ContractTickerRow, IndexRow, Row, Table};
+use crate::db::questdb::{BookKind, ContractBookRow, ContractTickerRow, IndexRow, Row};
 use crate::kalshi::book::{OrderBook, OrderbookMsg, price_to_dollars, qty_to_contracts};
 use crate::kalshi::client::OpenMarket;
 use crate::kalshi::stream::{
@@ -276,7 +276,6 @@ async fn handle_text(state: &AppState, shared: &Arc<FeedShared>, text: &str, ses
             let now_ms = Utc::now().timestamp_millis();
             if let Some(v) = parsed {
                 let row = IndexRow {
-                    table: Table::Live,
                     index_id: value.index_id.clone(),
                     value: v,
                     ts_ms: value.source_ts_ms.or(value.received_at).unwrap_or(now_ms),
