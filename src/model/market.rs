@@ -16,10 +16,24 @@ pub const RESERVED_TAGS: &[&str] = &["add", "auth", "ingest", "ws"];
 /// Coinbase product ids are `BASE-QUOTE`, e.g. `BTC-USD`.
 pub const COINBASE_PRODUCT_PATTERN: &str = "^[A-Z0-9]+-[A-Z0-9]+$";
 
+/// Coinbase perpetual-style futures ids have three parts, e.g.
+/// `BIP-20DEC30-CDE` (US) or `BTC-PERP-INTX` (international).
+pub const COINBASE_PERP_PRODUCT_PATTERN: &str = "^[A-Z0-9]+-[A-Z0-9]+-[A-Z0-9]+$";
+
 /// `COINBASE_PRODUCT_PATTERN`, for values that never pass through the schema.
 pub fn valid_coinbase_product(product: &str) -> bool {
+    product_parts(product) == Some(2)
+}
+
+/// `COINBASE_PERP_PRODUCT_PATTERN`, for values that never pass through the schema.
+pub fn valid_coinbase_perp_product(product: &str) -> bool {
+    product_parts(product) == Some(3)
+}
+
+/// Number of `-`-separated parts if every one is non-empty uppercase/digits.
+fn product_parts(product: &str) -> Option<usize> {
     let part = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
-    product.split_once('-').is_some_and(|(base, quote)| part(base) && part(quote))
+    product.split('-').try_fold(0, |n, p| part(p).then_some(n + 1))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +49,10 @@ pub struct Market {
     /// book), e.g. `BTC-USD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coinbase_product: Option<String>,
+    /// Coinbase perpetual-style future streamed the same way, e.g.
+    /// `BIP-20DEC30-CDE`. Book sizes are in contracts, not base currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coinbase_perp_product: Option<String>,
     pub title: String,
     pub kalshi: KalshiInfo,
     pub proxy: ProxyInfo,
@@ -65,6 +83,8 @@ pub struct AddMarket {
     #[serde(default)]
     pub coinbase_product: Option<String>,
     #[serde(default)]
+    pub coinbase_perp_product: Option<String>,
+    #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
     pub kalshi_env: Option<KalshiEnv>,
@@ -91,6 +111,7 @@ impl Market {
             series_ticker: input.series_ticker,
             index_id: input.index_id,
             coinbase_product: input.coinbase_product,
+            coinbase_perp_product: input.coinbase_perp_product,
             created_at: Utc::now().to_rfc3339(),
         }
     }
@@ -115,6 +136,7 @@ pub static MARKET_SPEC: LazyLock<ModelSpec> = LazyLock::new(|| {
                 "series_ticker": { "type": "string", "pattern": "^[A-Z0-9]+$" },
                 "index_id": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
                 "coinbase_product": { "type": "string", "pattern": COINBASE_PRODUCT_PATTERN },
+                "coinbase_perp_product": { "type": "string", "pattern": COINBASE_PERP_PRODUCT_PATTERN },
                 "title": { "type": "string", "minLength": 1, "maxLength": 200 },
                 "kalshi": {
                     "type": "object",
@@ -177,6 +199,7 @@ mod tests {
             series_ticker: "KXBTC15M".into(),
             index_id: "BRTI".into(),
             coinbase_product: None,
+            coinbase_perp_product: None,
             title: None,
             kalshi_env: None,
         }
@@ -209,6 +232,28 @@ mod tests {
 
         let mut input = add("btc-15m");
         input.coinbase_product = Some("btc/usd".into());
+        let v = serde_json::to_value(Market::from_add(input, &test_config())).unwrap();
+        assert!(MARKET_SPEC.validate(&v).is_err());
+    }
+
+    #[test]
+    fn coinbase_perp_product_is_optional_and_validated() {
+        let mut input = add("btc-15m");
+        input.coinbase_perp_product = Some("BIP-20DEC30-CDE".into());
+        let v = serde_json::to_value(Market::from_add(input, &test_config())).unwrap();
+        MARKET_SPEC.validate(&v).unwrap();
+        assert_eq!(v["coinbase_perp_product"], "BIP-20DEC30-CDE");
+
+        let v = serde_json::to_value(Market::from_add(add("btc-15m"), &test_config())).unwrap();
+        assert!(v.get("coinbase_perp_product").is_none());
+
+        assert!(valid_coinbase_perp_product("BIP-20DEC30-CDE") && valid_coinbase_perp_product("BTC-PERP-INTX"));
+        assert!(!valid_coinbase_perp_product("BTC-USD") && !valid_coinbase_perp_product("A-B-C-D"));
+        assert!(!valid_coinbase_perp_product("BIP--CDE") && !valid_coinbase_perp_product("bip-20dec30-cde"));
+
+        // A spot id is not a perp id.
+        let mut input = add("btc-15m");
+        input.coinbase_perp_product = Some("BTC-USD".into());
         let v = serde_json::to_value(Market::from_add(input, &test_config())).unwrap();
         assert!(MARKET_SPEC.validate(&v).is_err());
     }

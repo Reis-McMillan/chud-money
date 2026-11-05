@@ -41,7 +41,8 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
 static REFRESH_SLOT: Semaphore = Semaphore::const_new(1);
 
 /// What QuestDB holds for one market. `None` fields: the market names no
-/// `coinbase_product`.
+/// `coinbase_product` (`coinbase_*`) or no `coinbase_perp_product`
+/// (`coinbase_perp_*`).
 #[derive(Debug, Clone, Serialize)]
 pub struct QuestdbSummary {
     pub live: TableSummary,
@@ -51,6 +52,8 @@ pub struct QuestdbSummary {
     pub contract_book: TableSummary,
     pub coinbase_ticker: Option<TableSummary>,
     pub coinbase_book: Option<TableSummary>,
+    pub coinbase_perp_ticker: Option<TableSummary>,
+    pub coinbase_perp_book: Option<TableSummary>,
 }
 
 /// The cached summaries plus how fresh they are.
@@ -65,7 +68,7 @@ pub struct SummarySnapshot {
 }
 
 /// The tables and keys that make up a market's summary, in the order
-/// [`QuestdbSummary`] lists them; the coinbase pair only with a product.
+/// [`QuestdbSummary`] lists them; each coinbase pair only with its product.
 fn summary_keys(market: &Market) -> Vec<SummaryKey<'_>> {
     let index = market.index_id.as_str();
     let series = market.series_ticker.as_str();
@@ -79,6 +82,10 @@ fn summary_keys(market: &Market) -> Vec<SummaryKey<'_>> {
     if let Some(product) = market.coinbase_product.as_deref() {
         keys.push(SummaryKey { table: DataTable::CoinbaseTickerLive, key: product });
         keys.push(SummaryKey { table: DataTable::CoinbaseBookLive, key: product });
+    }
+    if let Some(perp) = market.coinbase_perp_product.as_deref() {
+        keys.push(SummaryKey { table: DataTable::CoinbasePerpTickerLive, key: perp });
+        keys.push(SummaryKey { table: DataTable::CoinbasePerpBookLive, key: perp });
     }
     keys
 }
@@ -95,6 +102,7 @@ async fn collect(
     // `summaries` returns exactly one entry per key, in order.
     let mut next = || it.next().unwrap_or_default();
     let has_product = market.coinbase_product.is_some();
+    let has_perp = market.coinbase_perp_product.is_some();
     Ok(QuestdbSummary {
         live: next(),
         hist: next(),
@@ -103,6 +111,8 @@ async fn collect(
         contract_book: next(),
         coinbase_ticker: has_product.then(&mut next),
         coinbase_book: has_product.then(&mut next),
+        coinbase_perp_ticker: has_perp.then(&mut next),
+        coinbase_perp_book: has_perp.then(&mut next),
     })
 }
 
@@ -157,12 +167,13 @@ mod tests {
     use crate::model::market::{KalshiInfo, ProxyInfo};
     use serde_json::json;
 
-    fn market(product: Option<&str>) -> Market {
+    fn market(product: Option<&str>, perp: Option<&str>) -> Market {
         Market {
             tag: "btc-15m".into(),
             series_ticker: "KXBTC15M".into(),
             index_id: "BRTI".into(),
             coinbase_product: product.map(str::to_string),
+            coinbase_perp_product: perp.map(str::to_string),
             title: "BTC 15m".into(),
             kalshi: KalshiInfo {
                 env: KalshiEnv::Prod,
@@ -194,6 +205,8 @@ mod tests {
             contract_book: summary(CONTRACT_BOOK_TABLE),
             coinbase_ticker: None,
             coinbase_book: None,
+            coinbase_perp_ticker: None,
+            coinbase_perp_book: None,
         };
         let v = serde_json::to_value(SummarySnapshot { tables: Some(tables), ..Default::default() }).unwrap();
         let book = &v["tables"]["contract_book"];
@@ -206,14 +219,14 @@ mod tests {
 
     #[test]
     fn coinbase_keys_only_when_the_market_names_a_product() {
-        let without = market(None);
+        let without = market(None, None);
         let keys = summary_keys(&without);
         assert_eq!(keys.len(), 5);
         assert!(keys.iter().all(|k| k.key == "BRTI" || k.key == "KXBTC15M"));
         assert_eq!((keys[0].table.name(), keys[0].table.key_column()), ("index_values_live", "index_id"));
         assert_eq!((keys[4].table.name(), keys[4].table.key_column()), ("contract_book_live", "series_ticker"));
 
-        let with = market(Some("BTC-USD"));
+        let with = market(Some("BTC-USD"), None);
         let keys = summary_keys(&with);
         assert_eq!(keys.len(), 7);
         assert_eq!(
@@ -223,6 +236,27 @@ mod tests {
         assert_eq!(
             (keys[6].table, keys[6].table.key_column(), keys[6].key),
             (DataTable::CoinbaseBookLive, "product", "BTC-USD")
+        );
+    }
+
+    #[test]
+    fn perp_keys_follow_the_spot_pair() {
+        let both = market(Some("BTC-USD"), Some("BIP-20DEC30-CDE"));
+        let keys = summary_keys(&both);
+        assert_eq!(keys.len(), 9);
+        assert_eq!((keys[6].table, keys[6].key), (DataTable::CoinbaseBookLive, "BTC-USD"));
+        assert_eq!(
+            (keys[7].table, keys[7].table.key_column(), keys[7].key),
+            (DataTable::CoinbasePerpTickerLive, "product", "BIP-20DEC30-CDE")
+        );
+        assert_eq!((keys[8].table, keys[8].key), (DataTable::CoinbasePerpBookLive, "BIP-20DEC30-CDE"));
+
+        let perp_only = market(None, Some("BIP-20DEC30-CDE"));
+        let keys = summary_keys(&perp_only);
+        assert_eq!(keys.len(), 7);
+        assert_eq!(
+            (keys[5].table, keys[6].table),
+            (DataTable::CoinbasePerpTickerLive, DataTable::CoinbasePerpBookLive)
         );
     }
 }

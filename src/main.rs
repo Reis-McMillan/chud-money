@@ -1,8 +1,9 @@
 //! chud-money: axum backend for a Kalshi trading dashboard.
 //!
 //! Stores tracked markets in MongoDB, streams each market's CF Benchmarks
-//! index, Kalshi ticker and orderbooks (plus the Coinbase spot ticker and
-//! level2 book when the market names a product) over per-market feed tasks,
+//! index, Kalshi ticker and orderbooks (plus the Coinbase ticker and level2
+//! book of the spot product and perpetual future the market names, if any)
+//! over per-market feed tasks,
 //! writes them to QuestDB, and exposes REST + websocket proxy endpoints.
 //!
 //! Configuration is read from the environment (see `.env.example`).

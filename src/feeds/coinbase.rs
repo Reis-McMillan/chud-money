@@ -1,5 +1,8 @@
 //! The Coinbase half of a market's feed: an Advanced Trade websocket session
-//! streaming the spot product's `ticker` and `level2` channels into QuestDB.
+//! streaming one product's `ticker` and `level2` channels into QuestDB. A
+//! market runs one session for its spot product and another for its
+//! perpetual-style future; both speak the same wire format and differ only in
+//! the tables they write (see [`CoinbaseMarket`]) and the status they update.
 //!
 //! Level2 is stored as an event log: the snapshot Coinbase sends on
 //! subscribe (one row per level), then absolute per-level updates. A gap in
@@ -23,7 +26,7 @@ use crate::coinbase::stream::{
     CHANNEL_HEARTBEATS, CHANNEL_L2_DATA, CHANNEL_LEVEL2, CHANNEL_SUBSCRIPTIONS, CHANNEL_TICKER, Envelope, L2Event,
     TickerEvent, WS_URL, decimal, rfc3339_nanos, subscribe_cmd,
 };
-use crate::db::questdb::{BookKind, CoinbaseBookRow, CoinbaseTickerRow, Row};
+use crate::db::questdb::{BookKind, CoinbaseBookRow, CoinbaseMarket, CoinbaseTickerRow, Row};
 use crate::state::AppState;
 
 const PING_INTERVAL: Duration = Duration::from_secs(10);
@@ -35,26 +38,46 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const SOURCE_TICKER: &str = "ws_ticker";
 const SOURCE_BOOK: &str = "ws_level2";
 
-pub async fn run_coinbase_feed(state: AppState, shared: Arc<FeedShared>, product: String) {
-    let tag = shared.market.tag.clone();
+/// What one session streams and where it reports.
+struct Session<'a> {
+    state: &'a AppState,
+    shared: &'a FeedShared,
+    product: &'a str,
+    market: CoinbaseMarket,
+}
+
+impl Session<'_> {
+    fn tag(&self) -> &str {
+        &self.shared.market.tag
+    }
+
+    async fn with_status(&self, f: impl FnOnce(&mut CoinbaseFeedStatus)) {
+        if let Some(cb) = self.shared.status.write().await.coinbase_mut(self.market) {
+            f(cb);
+        }
+    }
+}
+
+pub async fn run_coinbase_feed(state: AppState, shared: Arc<FeedShared>, product: String, market: CoinbaseMarket) {
+    let session = Session { state: &state, shared: &shared, product: &product, market };
+    let tag = session.tag();
     let mut backoff = BACKOFF_MIN;
     loop {
         let started = Instant::now();
-        let outcome = run_session(&state, &shared, &product).await;
-        {
-            let mut st = shared.status.write().await;
-            if let Some(cb) = st.coinbase.as_mut() {
+        let outcome = run_session(&session).await;
+        session
+            .with_status(|cb| {
                 cb.connected = false;
                 cb.reconnects += 1;
                 if let Err(e) = &outcome {
                     cb.last_error = Some(format!("{e:#}"));
                 }
-            }
-        }
+            })
+            .await;
         match &outcome {
-            Ok(()) => tracing::info!(%tag, %product, "coinbase session closed cleanly"),
+            Ok(()) => tracing::info!(%tag, %product, ?market, "coinbase session closed cleanly"),
             Err(e) => {
-                tracing::warn!(%tag, %product, error = format!("{e:#}"), "coinbase session failed")
+                tracing::warn!(%tag, %product, ?market, error = format!("{e:#}"), "coinbase session failed")
             }
         }
         if started.elapsed() > Duration::from_secs(60) {
@@ -65,16 +88,11 @@ pub async fn run_coinbase_feed(state: AppState, shared: Arc<FeedShared>, product
     }
 }
 
-async fn with_status(shared: &FeedShared, f: impl FnOnce(&mut CoinbaseFeedStatus)) {
-    if let Some(cb) = shared.status.write().await.coinbase.as_mut() {
-        f(cb);
-    }
-}
-
-async fn run_session(state: &AppState, shared: &Arc<FeedShared>, product: &str) -> Result<()> {
-    let tag = shared.market.tag.as_str();
+async fn run_session(session: &Session<'_>) -> Result<()> {
+    let Session { state, product, market, .. } = *session;
+    let tag = session.tag();
     let (mut ws, _) = connect_async(WS_URL).await.context("coinbase websocket handshake failed")?;
-    tracing::info!(%tag, %product, url = WS_URL, "coinbase feed connected");
+    tracing::info!(%tag, %product, ?market, url = WS_URL, "coinbase feed connected");
 
     // Coinbase drops a connection that has not subscribed within 5 seconds.
     for channel in [CHANNEL_HEARTBEATS, CHANNEL_TICKER, CHANNEL_LEVEL2] {
@@ -86,11 +104,12 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>, product: &str) 
             .await
             .with_context(|| format!("subscribing to coinbase {channel}"))?;
     }
-    with_status(shared, |cb| {
-        cb.connected = true;
-        cb.last_error = None;
-    })
-    .await;
+    session
+        .with_status(|cb| {
+            cb.connected = true;
+            cb.last_error = None;
+        })
+        .await;
 
     let mut last_seq: Option<u64> = None;
     let mut ping = interval(PING_INTERVAL);
@@ -104,9 +123,9 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>, product: &str) 
                 let Some(frame) = frame else { return Ok(()) };
                 stale.as_mut().reset(Instant::now() + STALE_AFTER);
                 match frame.context("coinbase websocket read failed")? {
-                    Message::Text(text) => handle_text(state, shared, product, text.as_str(), &mut last_seq).await?,
+                    Message::Text(text) => handle_text(session, text.as_str(), &mut last_seq).await?,
                     Message::Close(reason) => {
-                        tracing::info!(%tag, %product, ?reason, "coinbase websocket closed by server");
+                        tracing::info!(%tag, %product, ?market, ?reason, "coinbase websocket closed by server");
                         return Ok(());
                     }
                     _ => {}
@@ -121,27 +140,22 @@ async fn run_session(state: &AppState, shared: &Arc<FeedShared>, product: &str) 
 }
 
 /// Queue a live row without waiting; a full queue drops it and is counted.
-async fn try_queue(state: &AppState, shared: &FeedShared, row: Row) {
-    match state.questdb.ilp.try_send(row) {
+async fn try_queue(session: &Session<'_>, row: Row) {
+    match session.state.questdb.ilp.try_send(row) {
         Ok(()) => {}
         Err(TrySendError::Full(_)) => {
-            tracing::warn!(tag = %shared.market.tag, "ilp queue full; dropping coinbase row");
-            with_status(shared, |cb| cb.dropped_rows += 1).await;
+            tracing::warn!(tag = %session.tag(), market = ?session.market, "ilp queue full; dropping coinbase row");
+            session.with_status(|cb| cb.dropped_rows += 1).await;
         }
         Err(TrySendError::Closed(_)) => {
-            tracing::error!(tag = %shared.market.tag, "ilp writer gone")
+            tracing::error!(tag = %session.tag(), "ilp writer gone")
         }
     }
 }
 
-async fn handle_text(
-    state: &AppState,
-    shared: &Arc<FeedShared>,
-    product: &str,
-    text: &str,
-    last_seq: &mut Option<u64>,
-) -> Result<()> {
-    let tag = shared.market.tag.as_str();
+async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u64>) -> Result<()> {
+    let Session { state, product, market, .. } = *session;
+    let tag = session.tag();
     let env: Envelope = match serde_json::from_str(text) {
         Ok(e) => e,
         Err(_) => {
@@ -151,7 +165,7 @@ async fn handle_text(
     };
     if env.channel.is_empty() {
         // Error replies have no channel: `{"type":"error","message":"..."}`.
-        tracing::error!(%tag, %product, %text, "coinbase ws error");
+        tracing::error!(%tag, %product, ?market, %text, "coinbase ws error");
         return Ok(());
     }
     if let Some(last) = last_seq.replace(env.sequence_num)
@@ -178,6 +192,7 @@ async fn handle_text(
                     let price = decimal(&t.price);
                     last_price = price.or(last_price);
                     let row = CoinbaseTickerRow {
+                        market,
                         product: t.product_id,
                         price,
                         best_bid: decimal(&t.best_bid),
@@ -195,15 +210,16 @@ async fn handle_text(
                         received_at_ms: now.timestamp_millis(),
                         source: SOURCE_TICKER,
                     };
-                    try_queue(state, shared, row.into()).await;
+                    try_queue(session, row.into()).await;
                 }
             }
-            with_status(shared, |cb| {
-                cb.ticker_msgs += 1;
-                cb.last_price = last_price.or(cb.last_price);
-                cb.last_msg_at = Some(now);
-            })
-            .await;
+            session
+                .with_status(|cb| {
+                    cb.ticker_msgs += 1;
+                    cb.last_price = last_price.or(cb.last_price);
+                    cb.last_msg_at = Some(now);
+                })
+                .await;
         }
         c if c == CHANNEL_L2_DATA => {
             for event in env.events {
@@ -226,7 +242,7 @@ async fn handle_text(
                     }
                 };
                 if kind == BookKind::Snapshot {
-                    tracing::info!(%tag, %product, levels = event.updates.len(), "coinbase level2 snapshot");
+                    tracing::info!(%tag, %product, ?market, levels = event.updates.len(), "coinbase level2 snapshot");
                 }
                 for u in event.updates {
                     let side = match u.side.as_str() {
@@ -244,6 +260,7 @@ async fn handle_text(
                         continue;
                     };
                     let row = Row::CoinbaseBook(CoinbaseBookRow {
+                        market,
                         product: event.product_id.clone(),
                         side,
                         kind,
@@ -258,19 +275,20 @@ async fn handle_text(
                         // A partial snapshot is useless: wait for queue room.
                         state.questdb.ilp.send(row).await.map_err(|_| anyhow::anyhow!("ilp writer gone"))?;
                     } else {
-                        try_queue(state, shared, row).await;
+                        try_queue(session, row).await;
                     }
                 }
             }
-            with_status(shared, |cb| {
-                cb.book_msgs += 1;
-                cb.last_msg_at = Some(now);
-            })
-            .await;
+            session
+                .with_status(|cb| {
+                    cb.book_msgs += 1;
+                    cb.last_msg_at = Some(now);
+                })
+                .await;
         }
-        c if c == CHANNEL_HEARTBEATS => with_status(shared, |cb| cb.last_msg_at = Some(now)).await,
+        c if c == CHANNEL_HEARTBEATS => session.with_status(|cb| cb.last_msg_at = Some(now)).await,
         c if c == CHANNEL_SUBSCRIPTIONS => {
-            tracing::info!(%tag, %product, %text, "coinbase subscriptions")
+            tracing::info!(%tag, %product, ?market, %text, "coinbase subscriptions")
         }
         other => tracing::debug!(%tag, channel = other, "ignored coinbase frame"),
     }

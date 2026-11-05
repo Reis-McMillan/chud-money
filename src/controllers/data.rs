@@ -1,10 +1,11 @@
 //! Bulk export of one QuestDB table for one market as Server-Sent Events.
 //!
 //! `GET /{tag}/data/{table}?start=&end=` streams every row the table holds
-//! for the market's key (`index_id`, `series_ticker` or `coinbase_product`,
-//! depending on the table) with `ts` in `[start, end)`, oldest first. `table`
-//! is a QuestDB table name or its alias (`index-live`, `index-hist`,
-//! `candles`, `ticker`, `book`, `coinbase-ticker`, `coinbase-book`); `start`
+//! for the market's key (`index_id`, `series_ticker`, `coinbase_product` or
+//! `coinbase_perp_product`, depending on the table) with `ts` in
+//! `[start, end)`, oldest first. `table` is a QuestDB table name or its alias
+//! (`index-live`, `index-hist`, `candles`, `ticker`, `book`,
+//! `coinbase-ticker`, `coinbase-book`, `perp-ticker`, `perp-book`); `start`
 //! and `end` are RFC3339 and default to the table's first and last row.
 //!
 //! Events, each with a JSON body:
@@ -201,6 +202,10 @@ pub async fn stream(
             .coinbase_product
             .clone()
             .ok_or_else(|| AppError::BadRequest(format!("market '{tag}' has no coinbase_product")))?,
+        KeySource::CoinbasePerpProduct => market
+            .coinbase_perp_product
+            .clone()
+            .ok_or_else(|| AppError::BadRequest(format!("market '{tag}' has no coinbase_perp_product")))?,
     };
     let (mut start, end) = parse_range(range.start.as_deref(), range.end.as_deref())?;
     if let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(parse_ts) {

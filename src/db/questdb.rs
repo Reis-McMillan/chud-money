@@ -9,7 +9,7 @@
 //! at: one row per market ticker per candlestick period, DEDUP'd on
 //! `(ts, ticker)`.
 //!
-//! Four `*_live` tables hold what the websocket feeds stream:
+//! Six `*_live` tables hold what the websocket feeds stream:
 //!
 //! - `contract_ticker_live`: Kalshi's `ticker` channel, one row per market
 //!   per change (last price, best yes bid/ask and sizes, volume, open
@@ -26,6 +26,10 @@
 //! - `coinbase_book_live`: Coinbase `level2` as an event log with the same
 //!   snapshot-then-updates convention; `size` is the absolute resting size
 //!   at the level (`0` removes it).
+//! - `coinbase_perp_ticker_live` / `coinbase_perp_book_live`: the same two
+//!   channels for the market's perpetual-style future (e.g.
+//!   `BIP-20DEC30-CDE`), same columns. Sizes are in contracts, not base
+//!   currency.
 //!
 //! `ts` is the upstream timestamp and `received_at` when this process (or,
 //! for Coinbase level2, Coinbase's gateway) saw the frame. Prices are in
@@ -100,6 +104,34 @@ pub const CONTRACT_TICKER_TABLE: &str = "contract_ticker_live";
 pub const CONTRACT_BOOK_TABLE: &str = "contract_book_live";
 pub const COINBASE_TICKER_TABLE: &str = "coinbase_ticker_live";
 pub const COINBASE_BOOK_TABLE: &str = "coinbase_book_live";
+pub const COINBASE_PERP_TICKER_TABLE: &str = "coinbase_perp_ticker_live";
+pub const COINBASE_PERP_BOOK_TABLE: &str = "coinbase_perp_book_live";
+
+/// Which Coinbase product of a market a row belongs to, and so which pair of
+/// tables it goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoinbaseMarket {
+    /// `Market::coinbase_product`, e.g. `BTC-USD`.
+    Spot,
+    /// `Market::coinbase_perp_product`, e.g. `BIP-20DEC30-CDE`.
+    Perp,
+}
+
+impl CoinbaseMarket {
+    pub fn ticker_table(self) -> &'static str {
+        match self {
+            CoinbaseMarket::Spot => COINBASE_TICKER_TABLE,
+            CoinbaseMarket::Perp => COINBASE_PERP_TICKER_TABLE,
+        }
+    }
+
+    pub fn book_table(self) -> &'static str {
+        match self {
+            CoinbaseMarket::Spot => COINBASE_BOOK_TABLE,
+            CoinbaseMarket::Perp => COINBASE_PERP_BOOK_TABLE,
+        }
+    }
+}
 
 /// A table this API can export row by row, and how its rows are keyed to a
 /// market (see [`DataTable::key_source`]).
@@ -113,6 +145,8 @@ pub enum DataTable {
     ContractBookLive,
     CoinbaseTickerLive,
     CoinbaseBookLive,
+    CoinbasePerpTickerLive,
+    CoinbasePerpBookLive,
 }
 
 /// Which `Market` field holds the value a table's rows are keyed by.
@@ -121,6 +155,7 @@ pub enum KeySource {
     IndexId,
     SeriesTicker,
     CoinbaseProduct,
+    CoinbasePerpProduct,
 }
 
 /// How a column's text value from the simple query protocol becomes JSON.
@@ -233,7 +268,7 @@ const COINBASE_BOOK_COLUMNS: &[Column] = &[
 ];
 
 impl DataTable {
-    pub const ALL: [DataTable; 7] = [
+    pub const ALL: [DataTable; 9] = [
         DataTable::IndexValuesLive,
         DataTable::IndexValuesHist,
         DataTable::ContractCandlesHist,
@@ -241,6 +276,8 @@ impl DataTable {
         DataTable::ContractBookLive,
         DataTable::CoinbaseTickerLive,
         DataTable::CoinbaseBookLive,
+        DataTable::CoinbasePerpTickerLive,
+        DataTable::CoinbasePerpBookLive,
     ];
 
     pub fn name(self) -> &'static str {
@@ -252,6 +289,8 @@ impl DataTable {
             DataTable::ContractBookLive => CONTRACT_BOOK_TABLE,
             DataTable::CoinbaseTickerLive => COINBASE_TICKER_TABLE,
             DataTable::CoinbaseBookLive => COINBASE_BOOK_TABLE,
+            DataTable::CoinbasePerpTickerLive => COINBASE_PERP_TICKER_TABLE,
+            DataTable::CoinbasePerpBookLive => COINBASE_PERP_BOOK_TABLE,
         }
     }
 
@@ -265,6 +304,8 @@ impl DataTable {
             DataTable::ContractBookLive => "book",
             DataTable::CoinbaseTickerLive => "coinbase-ticker",
             DataTable::CoinbaseBookLive => "coinbase-book",
+            DataTable::CoinbasePerpTickerLive => "perp-ticker",
+            DataTable::CoinbasePerpBookLive => "perp-book",
         }
     }
 
@@ -282,6 +323,7 @@ impl DataTable {
                 KeySource::SeriesTicker
             }
             DataTable::CoinbaseTickerLive | DataTable::CoinbaseBookLive => KeySource::CoinbaseProduct,
+            DataTable::CoinbasePerpTickerLive | DataTable::CoinbasePerpBookLive => KeySource::CoinbasePerpProduct,
         }
     }
 
@@ -290,7 +332,7 @@ impl DataTable {
         match self.key_source() {
             KeySource::IndexId => "index_id",
             KeySource::SeriesTicker => "series_ticker",
-            KeySource::CoinbaseProduct => "product",
+            KeySource::CoinbaseProduct | KeySource::CoinbasePerpProduct => "product",
         }
     }
 
@@ -300,8 +342,8 @@ impl DataTable {
             DataTable::ContractCandlesHist => CANDLE_COLUMNS,
             DataTable::ContractTickerLive => CONTRACT_TICKER_COLUMNS,
             DataTable::ContractBookLive => CONTRACT_BOOK_COLUMNS,
-            DataTable::CoinbaseTickerLive => COINBASE_TICKER_COLUMNS,
-            DataTable::CoinbaseBookLive => COINBASE_BOOK_COLUMNS,
+            DataTable::CoinbaseTickerLive | DataTable::CoinbasePerpTickerLive => COINBASE_TICKER_COLUMNS,
+            DataTable::CoinbaseBookLive | DataTable::CoinbasePerpBookLive => COINBASE_BOOK_COLUMNS,
         }
     }
 
@@ -365,8 +407,8 @@ impl DataTable {
                     ts TIMESTAMP\
                  ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, ticker, seq, side, price);"
             ),
-            DataTable::CoinbaseTickerLive => format!(
-                "CREATE TABLE IF NOT EXISTS {COINBASE_TICKER_TABLE} (\
+            DataTable::CoinbaseTickerLive | DataTable::CoinbasePerpTickerLive => format!(
+                "CREATE TABLE IF NOT EXISTS {} (\
                     product SYMBOL CAPACITY 256 CACHE INDEX, \
                     source SYMBOL, \
                     price DOUBLE, \
@@ -378,10 +420,11 @@ impl DataTable {
                     sequence_num LONG, \
                     received_at TIMESTAMP, \
                     ts TIMESTAMP\
-                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, product);"
+                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, product);",
+                self.name()
             ),
-            DataTable::CoinbaseBookLive => format!(
-                "CREATE TABLE IF NOT EXISTS {COINBASE_BOOK_TABLE} (\
+            DataTable::CoinbaseBookLive | DataTable::CoinbasePerpBookLive => format!(
+                "CREATE TABLE IF NOT EXISTS {} (\
                     product SYMBOL CAPACITY 256 CACHE INDEX, \
                     side SYMBOL, \
                     kind SYMBOL, \
@@ -391,7 +434,8 @@ impl DataTable {
                     sequence_num LONG, \
                     received_at TIMESTAMP, \
                     ts TIMESTAMP\
-                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, product, side, price);"
+                 ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, product, side, price);",
+                self.name()
             ),
         }
     }
@@ -493,6 +537,7 @@ pub struct ContractBookRow {
 /// One Coinbase `ticker` event of one product (e.g. `BTC-USD`).
 #[derive(Debug, Clone)]
 pub struct CoinbaseTickerRow {
+    pub market: CoinbaseMarket,
     pub product: String,
     pub price: Option<f64>,
     pub best_bid: Option<f64>,
@@ -516,6 +561,7 @@ pub struct CoinbaseTickerRow {
 /// One level of a Coinbase level2 snapshot, or one update.
 #[derive(Debug, Clone)]
 pub struct CoinbaseBookRow {
+    pub market: CoinbaseMarket,
     pub product: String,
     /// `bid` or `offer`.
     pub side: &'static str,
@@ -1102,7 +1148,7 @@ fn push_contract_book(buf: &mut Buffer, row: &ContractBookRow) -> questdb::Resul
 }
 
 fn push_coinbase_ticker(buf: &mut Buffer, row: &CoinbaseTickerRow) -> questdb::Result<()> {
-    buf.table(COINBASE_TICKER_TABLE)?
+    buf.table(row.market.ticker_table())?
         .symbol("product", row.product.as_str())?
         .symbol("source", row.source)?
         .column_f64_opt("price", row.price)?
@@ -1122,7 +1168,7 @@ fn push_coinbase_ticker(buf: &mut Buffer, row: &CoinbaseTickerRow) -> questdb::R
 }
 
 fn push_coinbase_book(buf: &mut Buffer, row: &CoinbaseBookRow) -> questdb::Result<()> {
-    buf.table(COINBASE_BOOK_TABLE)?
+    buf.table(row.market.book_table())?
         .symbol("product", row.product.as_str())?
         .symbol("side", row.side)?
         .symbol("kind", row.kind.as_str())?
@@ -1411,12 +1457,16 @@ mod tests {
         }
         assert_eq!(DataTable::parse("book"), Some(DataTable::ContractBookLive));
         assert_eq!(DataTable::parse("coinbase_book"), Some(DataTable::CoinbaseBookLive));
+        assert_eq!(DataTable::parse("perp-book"), Some(DataTable::CoinbasePerpBookLive));
+        assert_eq!(DataTable::parse("coinbase_perp_ticker_live"), Some(DataTable::CoinbasePerpTickerLive));
         assert_eq!(DataTable::parse("index_values_live"), Some(DataTable::IndexValuesLive));
         assert_eq!(DataTable::parse("orders"), None);
         assert_eq!(DataTable::parse(""), None);
         assert_eq!(DataTable::IndexValuesHist.key_column(), "index_id");
         assert_eq!(DataTable::ContractCandlesHist.key_column(), "series_ticker");
         assert_eq!(DataTable::CoinbaseTickerLive.key_column(), "product");
+        assert_eq!(DataTable::CoinbasePerpBookLive.key_source(), KeySource::CoinbasePerpProduct);
+        assert_eq!(DataTable::CoinbasePerpBookLive.key_column(), "product");
     }
 
     /// The exported column list must be exactly what `ensure_tables` creates.

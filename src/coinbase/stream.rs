@@ -166,4 +166,29 @@ mod tests {
                 .unwrap();
         assert_eq!(env.channel, CHANNEL_HEARTBEATS);
     }
+
+    /// Perpetual-style futures stream on the same socket in the spot shape;
+    /// frames captured from `BIP-20DEC30-CDE` (sizes are contracts).
+    #[test]
+    fn parses_perp_frames() {
+        let text = r#"{"channel":"ticker","timestamp":"2026-11-05T21:43:27.538573991Z","sequence_num":0,
+            "events":[{"type":"snapshot","tickers":[{"type":"ticker","product_id":"BIP-20DEC30-CDE","price":"75855",
+            "volume_24_h":"864587","low_24_h":"75445","high_24_h":"80990","low_52_w":"57710","high_52_w":"107465",
+            "price_percent_chg_24_h":"-5.40591096146652","best_bid":"75855","best_ask":"75865",
+            "best_bid_quantity":"11","best_ask_quantity":"59"}]}]}"#;
+        let env: Envelope = serde_json::from_str(text).unwrap();
+        let event: TickerEvent = serde_json::from_value(env.events[0].clone()).unwrap();
+        let t = &event.tickers[0];
+        assert_eq!(t.product_id, "BIP-20DEC30-CDE");
+        assert_eq!((decimal(&t.best_bid), decimal(&t.best_ask_quantity)), (Some(75_855.0), Some(59.0)));
+
+        let text = r#"{"channel":"l2_data","timestamp":"2026-11-05T21:43:27.542359267Z","sequence_num":2,
+            "events":[{"type":"snapshot","product_id":"BIP-20DEC30-CDE","updates":[
+              {"side":"bid","event_time":"2026-11-05T21:43:27.428966Z","price_level":"75850","new_quantity":"243"}]}]}"#;
+        let env: Envelope = serde_json::from_str(text).unwrap();
+        assert_eq!(env.channel, CHANNEL_L2_DATA);
+        let event: L2Event = serde_json::from_value(env.events[0].clone()).unwrap();
+        assert_eq!((event.typ.as_str(), event.product_id.as_str()), ("snapshot", "BIP-20DEC30-CDE"));
+        assert_eq!(event.updates[0].new_quantity, "243");
+    }
 }

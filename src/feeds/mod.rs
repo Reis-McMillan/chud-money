@@ -1,6 +1,7 @@
 //! Registry of background feed tasks: one Kalshi session per market document,
-//! a Coinbase session for markets that name a spot product, and a task that
-//! keeps the market's QuestDB summary cache fresh.
+//! a Coinbase session each for the spot product and the perpetual future a
+//! market names, and a task that keeps the market's QuestDB summary cache
+//! fresh.
 
 pub mod coinbase;
 pub mod summary;
@@ -14,9 +15,10 @@ use serde::Serialize;
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
 
+use crate::db::questdb::CoinbaseMarket;
 use crate::kalshi::book::OrderBook;
 use crate::kalshi::client::OpenMarket;
-use crate::model::market::{Market, valid_coinbase_product};
+use crate::model::market::{Market, valid_coinbase_perp_product, valid_coinbase_product};
 use crate::state::AppState;
 use summary::SummarySnapshot;
 
@@ -42,6 +44,18 @@ pub struct FeedStatus {
     pub last_error: Option<String>,
     /// `None` for a market without a `coinbase_product`.
     pub coinbase: Option<CoinbaseFeedStatus>,
+    /// `None` for a market without a `coinbase_perp_product`.
+    pub coinbase_perp: Option<CoinbaseFeedStatus>,
+}
+
+impl FeedStatus {
+    /// The status of `market`'s Coinbase session, if the market has one.
+    pub fn coinbase_mut(&mut self, market: CoinbaseMarket) -> Option<&mut CoinbaseFeedStatus> {
+        match market {
+            CoinbaseMarket::Spot => self.coinbase.as_mut(),
+            CoinbaseMarket::Perp => self.coinbase_perp.as_mut(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -77,13 +91,14 @@ pub struct FeedHandle {
     pub shared: Arc<FeedShared>,
     task: JoinHandle<()>,
     coinbase_task: Option<JoinHandle<()>>,
+    coinbase_perp_task: Option<JoinHandle<()>>,
     summary_task: JoinHandle<()>,
 }
 
 impl Drop for FeedHandle {
     fn drop(&mut self) {
         self.task.abort();
-        if let Some(task) = &self.coinbase_task {
+        for task in [&self.coinbase_task, &self.coinbase_perp_task].into_iter().flatten() {
             task.abort();
         }
         self.summary_task.abort();
@@ -123,18 +138,22 @@ impl FeedRegistry {
             return false;
         }
         let tag = market.tag.clone();
-        let product = match market.coinbase_product.clone() {
-            Some(p) if valid_coinbase_product(&p) => Some(p),
+        let checked = |field: &str, product: &Option<String>, valid: fn(&str) -> bool| match product {
+            Some(p) if valid(p) => Some(p.clone()),
             Some(p) => {
-                tracing::warn!(%tag, product = %p, "coinbase_product is not a product id; no coinbase feed");
+                tracing::warn!(%tag, product = %p, "{field} is not a valid product id; no coinbase feed for it");
                 None
             }
             None => None,
         };
+        let product = checked("coinbase_product", &market.coinbase_product, valid_coinbase_product);
+        let perp = checked("coinbase_perp_product", &market.coinbase_perp_product, valid_coinbase_perp_product);
+        let cb_status = |p: &String| CoinbaseFeedStatus { product: p.clone(), ..Default::default() };
         let (ticker_tx, _) = broadcast::channel(TICKER_CAPACITY);
         let (orderbook_tx, _) = broadcast::channel(ORDERBOOK_CAPACITY);
         let status = FeedStatus {
-            coinbase: product.as_ref().map(|p| CoinbaseFeedStatus { product: p.clone(), ..Default::default() }),
+            coinbase: product.as_ref().map(cb_status),
+            coinbase_perp: perp.as_ref().map(cb_status),
             ..Default::default()
         };
         let shared = Arc::new(FeedShared {
@@ -146,10 +165,11 @@ impl FeedRegistry {
             summary: RwLock::new(SummarySnapshot::default()),
         });
         let task = tokio::spawn(task::run_feed(state.clone(), shared.clone()));
-        let coinbase_task =
-            product.map(|p| tokio::spawn(coinbase::run_coinbase_feed(state.clone(), shared.clone(), p)));
+        let coinbase = |p, m| tokio::spawn(coinbase::run_coinbase_feed(state.clone(), shared.clone(), p, m));
+        let coinbase_task = product.map(|p| coinbase(p, CoinbaseMarket::Spot));
+        let coinbase_perp_task = perp.map(|p| coinbase(p, CoinbaseMarket::Perp));
         let summary_task = tokio::spawn(summary::run_summary_refresh(state.clone(), shared.clone()));
-        map.insert(tag, FeedHandle { shared, task, coinbase_task, summary_task });
+        map.insert(tag, FeedHandle { shared, task, coinbase_task, coinbase_perp_task, summary_task });
         true
     }
 
