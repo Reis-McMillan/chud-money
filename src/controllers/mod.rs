@@ -7,8 +7,10 @@
 //! - `GET  /{tag}`               market document + feed status + cached QuestDB summary
 //! - `DELETE /{tag}`             🔒 stop the feed and delete the document
 //! - `GET  /{tag}/data/{table}`  🔒 stream a QuestDB table for one market as SSE (`?start=&end=`)
-//! - `GET  /ws/{tag}/ticker`     🔒 proxy of the CF Benchmarks 5Hz index stream
+//! - `GET  /{tag}/series/{table}` 🔒 one price series, downsampled (`?start=&end=&step=`)
+//! - `GET  /ws/{tag}/ticker`     🔒 CF Benchmarks 5Hz index frames + Coinbase spot/perp prices
 //! - `GET  /ws/{tag}/orderbook`  🔒 proxy of Kalshi orderbook snapshot/delta frames
+//! - `GET  /ws/{tag}/coinbase-book` 🔒 top levels of the Coinbase spot/perp books
 //!
 //! 🔒 routes go through `middleware::authenticated` and need a bearer token.
 //! Websocket and SSE routes also take it as `?access_token=`, since neither a
@@ -17,6 +19,7 @@
 pub mod auth;
 pub mod data;
 pub mod markets;
+pub mod series;
 pub mod ws;
 
 use axum::routing::{delete, get, post};
@@ -40,8 +43,10 @@ pub fn router(state: AppState) -> Router {
         .route("/add", post(markets::add))
         .route("/{tag}", delete(markets::remove))
         .route("/{tag}/data/{table}", get(data::stream))
+        .route("/{tag}/series/{table}", get(series::get))
         .route("/ws/{tag}/ticker", get(ws::ticker))
         .route("/ws/{tag}/orderbook", get(ws::orderbook))
+        .route("/ws/{tag}/coinbase-book", get(ws::coinbase_book))
         .route_layer(middleware::from_fn_with_state(state.clone(), authenticated));
 
     Router::new()
@@ -84,7 +89,9 @@ mod tests {
             .route("/add", post(ok))
             .route("/{tag}", delete(ok))
             .route("/{tag}/data/{table}", get(ok))
+            .route("/{tag}/series/{table}", get(ok))
             .route("/ws/{tag}/ticker", get(ok))
+            .route("/ws/{tag}/coinbase-book", get(ok))
             .route_layer(middleware::from_fn(deny));
         let app: Router = Router::new().route("/", get(ok)).route("/{tag}", get(ok)).merge(protected);
 
@@ -102,6 +109,8 @@ mod tests {
         assert_eq!(call(Method::POST, "/add").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/ws/btc-15m/ticker").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/btc-15m/data/contract_book_live").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(Method::GET, "/btc-15m/series/index-live").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(call(Method::GET, "/ws/btc-15m/coinbase-book").await, StatusCode::UNAUTHORIZED);
         assert_eq!(call(Method::GET, "/").await, StatusCode::OK);
     }
 

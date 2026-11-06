@@ -7,7 +7,12 @@
 //! Level2 is stored as an event log: the snapshot Coinbase sends on
 //! subscribe (one row per level), then absolute per-level updates. A gap in
 //! the connection's `sequence_num` ends the session so the reconnect stores
-//! a fresh snapshot. Subscriptions carry a JWT when a CDP key is configured
+//! a fresh snapshot.
+//!
+//! For proxy clients the session also keeps the book in memory and
+//! publishes its top levels on `FeedShared::coinbase_book_tx` at most every
+//! `PUBLISH_INTERVAL`, and sends the last price of every ticker frame on
+//! `FeedShared::ticker_tx` next to the BRTI frames. Subscriptions carry a JWT when a CDP key is configured
 //! and go out unauthenticated otherwise. Reconnects back off exponentially.
 
 use std::sync::Arc;
@@ -22,6 +27,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use super::{CoinbaseFeedStatus, FeedShared};
+use crate::coinbase::book::{CoinbaseBook, TOP_DEPTH};
 use crate::coinbase::stream::{
     CHANNEL_HEARTBEATS, CHANNEL_L2_DATA, CHANNEL_LEVEL2, CHANNEL_SUBSCRIPTIONS, CHANNEL_TICKER, Envelope, L2Event,
     TickerEvent, WS_URL, decimal, rfc3339_nanos, subscribe_cmd,
@@ -34,6 +40,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(10);
 const STALE_AFTER: Duration = Duration::from_secs(30);
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// How often a changed book's top levels go out to proxy clients.
+pub const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 const SOURCE_TICKER: &str = "ws_ticker";
 const SOURCE_BOOK: &str = "ws_level2";
@@ -65,6 +74,8 @@ pub async fn run_coinbase_feed(state: AppState, shared: Arc<FeedShared>, product
     loop {
         let started = Instant::now();
         let outcome = run_session(&session).await;
+        // The book is no longer maintained; do not replay it to new clients.
+        shared.coinbase_tops.write().await.remove(&market);
         session
             .with_status(|cb| {
                 cb.connected = false;
@@ -111,9 +122,11 @@ async fn run_session(session: &Session<'_>) -> Result<()> {
         })
         .await;
 
-    let mut last_seq: Option<u64> = None;
+    let mut local = Local::default();
     let mut ping = interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut publish = interval(PUBLISH_INTERVAL);
+    publish.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let stale = tokio::time::sleep(STALE_AFTER);
     tokio::pin!(stale);
 
@@ -123,7 +136,7 @@ async fn run_session(session: &Session<'_>) -> Result<()> {
                 let Some(frame) = frame else { return Ok(()) };
                 stale.as_mut().reset(Instant::now() + STALE_AFTER);
                 match frame.context("coinbase websocket read failed")? {
-                    Message::Text(text) => handle_text(session, text.as_str(), &mut last_seq).await?,
+                    Message::Text(text) => handle_text(session, text.as_str(), &mut local).await?,
                     Message::Close(reason) => {
                         tracing::info!(%tag, %product, ?market, ?reason, "coinbase websocket closed by server");
                         return Ok(());
@@ -134,9 +147,38 @@ async fn run_session(session: &Session<'_>) -> Result<()> {
 
             _ = ping.tick() => ws.send(Message::Ping(Vec::new().into())).await.context("ping")?,
 
+            _ = publish.tick(), if local.dirty && local.book.is_ready() => {
+                local.dirty = false;
+                let ts_ms = Utc::now().timestamp_millis();
+                let frame: Arc<str> = Arc::from(local.book.top_frame(market, product, TOP_DEPTH, ts_ms));
+                session.shared.coinbase_tops.write().await.insert(market, frame.clone());
+                let _ = session.shared.coinbase_book_tx.send(frame);
+            }
+
             _ = &mut stale => anyhow::bail!("no coinbase frames received for {STALE_AFTER:?}"),
         }
     }
+}
+
+/// Per-connection state: the sequence check and the in-memory book.
+#[derive(Default)]
+struct Local {
+    last_seq: Option<u64>,
+    book: CoinbaseBook,
+    /// The book changed since its top was last published.
+    dirty: bool,
+}
+
+/// `{"type":"coinbase_ticker","market":"spot"|"perp","product":..,"price":..,"ts_ms":..}`
+fn ticker_frame(market: CoinbaseMarket, product: &str, price: f64, ts_ms: i64) -> String {
+    serde_json::json!({
+        "type": "coinbase_ticker",
+        "market": market.label(),
+        "product": product,
+        "price": price,
+        "ts_ms": ts_ms,
+    })
+    .to_string()
 }
 
 /// Queue a live row without waiting; a full queue drops it and is counted.
@@ -153,7 +195,7 @@ async fn try_queue(session: &Session<'_>, row: Row) {
     }
 }
 
-async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u64>) -> Result<()> {
+async fn handle_text(session: &Session<'_>, text: &str, local: &mut Local) -> Result<()> {
     let Session { state, product, market, .. } = *session;
     let tag = session.tag();
     let env: Envelope = match serde_json::from_str(text) {
@@ -168,7 +210,7 @@ async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u6
         tracing::error!(%tag, %product, ?market, %text, "coinbase ws error");
         return Ok(());
     }
-    if let Some(last) = last_seq.replace(env.sequence_num)
+    if let Some(last) = local.last_seq.replace(env.sequence_num)
         && env.sequence_num != last + 1
     {
         anyhow::bail!("coinbase sequence gap: expected {}, got {}", last + 1, env.sequence_num);
@@ -213,6 +255,10 @@ async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u6
                     try_queue(session, row.into()).await;
                 }
             }
+            if let Some(price) = last_price {
+                let frame = ticker_frame(market, product, price, sent_ns / 1_000_000);
+                let _ = session.shared.ticker_tx.send(Arc::from(frame));
+            }
             session
                 .with_status(|cb| {
                     cb.ticker_msgs += 1;
@@ -243,6 +289,7 @@ async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u6
                 };
                 if kind == BookKind::Snapshot {
                     tracing::info!(%tag, %product, ?market, levels = event.updates.len(), "coinbase level2 snapshot");
+                    local.book.begin_snapshot();
                 }
                 for u in event.updates {
                     let side = match u.side.as_str() {
@@ -259,6 +306,8 @@ async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u6
                         tracing::warn!(%tag, price = %u.price_level, size = %u.new_quantity, "bad coinbase level");
                         continue;
                     };
+                    local.book.apply(kind, side, price, size);
+                    local.dirty = true;
                     let row = Row::CoinbaseBook(CoinbaseBookRow {
                         market,
                         product: event.product_id.clone(),
@@ -293,4 +342,19 @@ async fn handle_text(session: &Session<'_>, text: &str, last_seq: &mut Option<u6
         other => tracing::debug!(%tag, channel = other, "ignored coinbase frame"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    #[test]
+    fn ticker_frame_encoding() {
+        let v: Value = serde_json::from_str(&ticker_frame(CoinbaseMarket::Spot, "BTC-USD", 42_500.5, 1_705_314_645_123)).unwrap();
+        assert_eq!(
+            v,
+            json!({ "type": "coinbase_ticker", "market": "spot", "product": "BTC-USD", "price": 42_500.5, "ts_ms": 1_705_314_645_123_i64 })
+        );
+    }
 }

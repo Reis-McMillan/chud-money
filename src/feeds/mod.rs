@@ -22,8 +22,11 @@ use crate::model::market::{Market, valid_coinbase_perp_product, valid_coinbase_p
 use crate::state::AppState;
 use summary::SummarySnapshot;
 
-const TICKER_CAPACITY: usize = 64;
+/// BRTI at 5 Hz plus Coinbase spot and perp prices on every match share it.
+const TICKER_CAPACITY: usize = 256;
 const ORDERBOOK_CAPACITY: usize = 1024;
+/// Coinbase top-of-book frames, at most 4 Hz per product.
+const COINBASE_BOOK_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FeedStatus {
@@ -75,13 +78,22 @@ pub struct CoinbaseFeedStatus {
 /// tasks and its readers.
 pub struct FeedShared {
     pub market: Market,
-    /// Raw `cfbenchmarks_value_5hz` envelopes as received from Kalshi.
+    /// Raw `cfbenchmarks_value_5hz` envelopes as received from Kalshi, and
+    /// `coinbase_ticker` frames (see `coinbase::ticker_frame`) with the last
+    /// price of the spot product and the perpetual future.
     pub ticker_tx: broadcast::Sender<Arc<str>>,
     /// Raw `orderbook_snapshot` / `orderbook_delta` envelopes.
     pub orderbook_tx: broadcast::Sender<Arc<str>>,
     /// Current book per market ticker, rebuilt from the frames above so a
     /// proxy client that connects mid-session can be handed a snapshot.
     pub books: RwLock<HashMap<String, OrderBook>>,
+    /// `coinbase_book` frames: the top levels of the spot and perp books,
+    /// published at most every `coinbase::PUBLISH_INTERVAL`.
+    pub coinbase_book_tx: broadcast::Sender<Arc<str>>,
+    /// The last `coinbase_book` frame per product, replayed to a proxy client
+    /// on connect. Removed when that product's session ends, so a client
+    /// never gets a book that is no longer being maintained.
+    pub coinbase_tops: RwLock<HashMap<CoinbaseMarket, Arc<str>>>,
     pub status: RwLock<FeedStatus>,
     /// Written by `summary::run_summary_refresh`, read by `GET /{tag}`.
     pub summary: RwLock<SummarySnapshot>,
@@ -151,6 +163,7 @@ impl FeedRegistry {
         let cb_status = |p: &String| CoinbaseFeedStatus { product: p.clone(), ..Default::default() };
         let (ticker_tx, _) = broadcast::channel(TICKER_CAPACITY);
         let (orderbook_tx, _) = broadcast::channel(ORDERBOOK_CAPACITY);
+        let (coinbase_book_tx, _) = broadcast::channel(COINBASE_BOOK_CAPACITY);
         let status = FeedStatus {
             coinbase: product.as_ref().map(cb_status),
             coinbase_perp: perp.as_ref().map(cb_status),
@@ -161,6 +174,8 @@ impl FeedRegistry {
             ticker_tx,
             orderbook_tx,
             books: RwLock::new(HashMap::new()),
+            coinbase_book_tx,
+            coinbase_tops: RwLock::new(HashMap::new()),
             status: RwLock::new(status),
             summary: RwLock::new(SummarySnapshot::default()),
         });

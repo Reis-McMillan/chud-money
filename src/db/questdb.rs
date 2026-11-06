@@ -87,7 +87,7 @@ pub const COINBASE_PERP_BOOK_TABLE: &str = "coinbase_perp_book_live";
 
 /// Which Coinbase product of a market a row belongs to, and so which pair of
 /// tables it goes to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CoinbaseMarket {
     /// `Market::coinbase_product`, e.g. `BTC-USD`.
     Spot,
@@ -96,6 +96,14 @@ pub enum CoinbaseMarket {
 }
 
 impl CoinbaseMarket {
+    /// How clients tell the two apart in proxied frames.
+    pub fn label(self) -> &'static str {
+        match self {
+            CoinbaseMarket::Spot => "spot",
+            CoinbaseMarket::Perp => "perp",
+        }
+    }
+
     pub fn ticker_table(self) -> &'static str {
         match self {
             CoinbaseMarket::Spot => COINBASE_TICKER_TABLE,
@@ -281,6 +289,19 @@ impl DataTable {
             KeySource::IndexId => "index_id",
             KeySource::SeriesTicker => "series_ticker",
             KeySource::CoinbaseProduct | KeySource::CoinbasePerpProduct => "product",
+        }
+    }
+
+    /// The price column a downsampled series is read from, for the tables
+    /// that have one (see `Questdb::sample_series`).
+    pub fn value_column(self) -> Option<&'static str> {
+        match self {
+            DataTable::IndexValuesLive => Some("value"),
+            DataTable::CoinbaseTickerLive | DataTable::CoinbasePerpTickerLive => Some("price"),
+            DataTable::ContractTickerLive
+            | DataTable::ContractBookLive
+            | DataTable::CoinbaseBookLive
+            | DataTable::CoinbasePerpBookLive => None,
         }
     }
 
@@ -775,6 +796,33 @@ impl Questdb {
         }))
     }
 
+    /// `table`'s price for `key` over `[start_us, end_us)`, one point per
+    /// `step_s` bucket (the bucket's last value), oldest first, as
+    /// `(bucket start ms, value)`. Empty buckets and null or non-finite
+    /// values are left out. `table` must have a `value_column`.
+    pub async fn sample_series(
+        &self,
+        table: DataTable,
+        key: &str,
+        start_us: i64,
+        end_us: i64,
+        step_s: i64,
+    ) -> Result<Vec<(i64, f64)>, tokio_postgres::Error> {
+        let Some(sql) = series_sql(table, key, start_us, end_us, step_s) else { return Ok(Vec::new()) };
+        let rows = self.pg().await?.simple_query(&sql).await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => {
+                    let us: i64 = r.get(0)?.parse().ok()?;
+                    let v: f64 = r.get(1)?.parse().ok()?;
+                    v.is_finite().then_some((us.div_euclid(1_000), v))
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Counts and time spans for `keys`, one summary each, in order, brought
     /// up to each table's current last row by advancing `progress` (one entry
     /// per key, zeroed at startup and kept by the caller between calls).
@@ -892,6 +940,23 @@ fn window_sql(table: DataTable, key: &str, start_us: i64, end_us: i64) -> String
         ts_literal_us(start_us),
         ts_literal_us(end_us),
     )
+}
+
+/// The `SAMPLE BY` query behind `Questdb::sample_series`, or `None` when
+/// `table` has no price column. The bucket timestamp is cast in an outer
+/// query so the inner one keeps `ts` as its sampling key.
+fn series_sql(table: DataTable, key: &str, start_us: i64, end_us: i64, step_s: i64) -> Option<String> {
+    let col = table.value_column()?;
+    let key = key.replace('\'', "''");
+    Some(format!(
+        "SELECT cast(ts AS long) AS ts_us, v FROM (\
+         SELECT ts, last({col}) AS v FROM {} WHERE {} = '{key}' AND ts >= '{}' AND ts < '{}' \
+         SAMPLE BY {step_s}s ALIGN TO CALENDAR) ORDER BY ts_us",
+        table.name(),
+        table.key_column(),
+        ts_literal_us(start_us),
+        ts_literal_us(end_us),
+    ))
 }
 
 /// Appends a simple-query row to `out` as a compact JSON array, one value per
@@ -1326,6 +1391,35 @@ mod tests {
              AND ts >= '1970-01-01T00:00:00.000000Z' AND ts < '1970-01-01T00:00:01.500000Z' ORDER BY ts"
         );
         assert!(window_sql(DataTable::IndexValuesLive, "O'B", 0, 1).contains("index_id = 'O''B'"));
+    }
+
+    #[test]
+    fn series_sql_samples_the_price_column() {
+        assert_eq!(
+            series_sql(DataTable::IndexValuesLive, "BRTI", 0, 60_000_000, 5).unwrap(),
+            "SELECT cast(ts AS long) AS ts_us, v FROM (\
+             SELECT ts, last(value) AS v FROM index_values_live WHERE index_id = 'BRTI' \
+             AND ts >= '1970-01-01T00:00:00.000000Z' AND ts < '1970-01-01T00:01:00.000000Z' \
+             SAMPLE BY 5s ALIGN TO CALENDAR) ORDER BY ts_us"
+        );
+        let sql = series_sql(DataTable::CoinbasePerpTickerLive, "O'B", 0, 1, 60).unwrap();
+        assert!(sql.contains("last(price)") && sql.contains("FROM coinbase_perp_ticker_live"), "{sql}");
+        assert!(sql.contains("product = 'O''B'") && sql.contains("SAMPLE BY 60s"), "{sql}");
+        assert!(series_sql(DataTable::CoinbaseBookLive, "BTC-USD", 0, 1, 1).is_none());
+    }
+
+    #[test]
+    fn value_columns() {
+        let with: Vec<_> = DataTable::ALL.into_iter().filter(|t| t.value_column().is_some()).collect();
+        assert_eq!(
+            with,
+            vec![DataTable::IndexValuesLive, DataTable::CoinbaseTickerLive, DataTable::CoinbasePerpTickerLive]
+        );
+        // Every value column is a DOUBLE column of its table.
+        for t in with {
+            let col = t.value_column().unwrap();
+            assert!(t.columns().iter().any(|c| c.name == col && c.kind == ColKind::Double), "{t:?}");
+        }
     }
 
     #[test]

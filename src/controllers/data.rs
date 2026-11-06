@@ -195,18 +195,7 @@ pub async fn stream(
         let known = DataTable::ALL.map(|t| format!("{} ({})", t.name(), t.alias())).join(", ");
         AppError::NotFound(format!("table '{table}'; known tables: {known}"))
     })?;
-    let key = match table.key_source() {
-        KeySource::IndexId => market.index_id.clone(),
-        KeySource::SeriesTicker => market.series_ticker.clone(),
-        KeySource::CoinbaseProduct => market
-            .coinbase_product
-            .clone()
-            .ok_or_else(|| AppError::BadRequest(format!("market '{tag}' has no coinbase_product")))?,
-        KeySource::CoinbasePerpProduct => market
-            .coinbase_perp_product
-            .clone()
-            .ok_or_else(|| AppError::BadRequest(format!("market '{tag}' has no coinbase_perp_product")))?,
-    };
+    let key = market_key(&market, table)?;
     let (mut start, end) = parse_range(range.start.as_deref(), range.end.as_deref())?;
     if let Some(id) = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(parse_ts) {
         start = Some(id);
@@ -231,6 +220,24 @@ pub async fn stream(
     tracing::info!(%tag, table = table.name(), user = %user.id, start_us, end_us, "data stream opened");
     let rows = state.questdb.stream_data(table, key.clone(), start_us, end_us).await?;
     Ok(sse(Box::pin(events(table, key, (start_us, end_us), rows, slot, BatchLimits::default()))))
+}
+
+/// The value `table`'s rows are keyed by for `market`; 400 when the market
+/// names no product for a Coinbase table.
+pub fn market_key(market: &Market, table: DataTable) -> Result<String, AppError> {
+    let tag = &market.tag;
+    Ok(match table.key_source() {
+        KeySource::IndexId => market.index_id.clone(),
+        KeySource::SeriesTicker => market.series_ticker.clone(),
+        KeySource::CoinbaseProduct => market
+            .coinbase_product
+            .clone()
+            .ok_or_else(|| AppError::BadRequest(format!("market '{tag}' has no coinbase_product")))?,
+        KeySource::CoinbasePerpProduct => market
+            .coinbase_perp_product
+            .clone()
+            .ok_or_else(|| AppError::BadRequest(format!("market '{tag}' has no coinbase_perp_product")))?,
+    })
 }
 
 fn sse(events: EventStream) -> SseResponse {
@@ -388,13 +395,13 @@ fn ts_string(us: i64) -> String {
 }
 
 /// An RFC3339 timestamp as microseconds since the epoch.
-fn parse_ts(s: &str) -> Option<i64> {
+pub(crate) fn parse_ts(s: &str) -> Option<i64> {
     DateTime::parse_from_rfc3339(s.trim()).ok().map(|d| d.timestamp_micros())
 }
 
 /// `start`/`end` as microseconds; either may be absent. Rejects non-RFC3339
 /// values and an empty or inverted range.
-fn parse_range(start: Option<&str>, end: Option<&str>) -> Result<(Option<i64>, Option<i64>), AppError> {
+pub(crate) fn parse_range(start: Option<&str>, end: Option<&str>) -> Result<(Option<i64>, Option<i64>), AppError> {
     let parse = |name: &str, value: Option<&str>| {
         value
             .map(|s| parse_ts(s).ok_or_else(|| AppError::BadRequest(format!("{name} must be an RFC3339 timestamp"))))

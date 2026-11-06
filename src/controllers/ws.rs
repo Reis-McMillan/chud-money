@@ -3,7 +3,11 @@
 //! behind the channel buffer gets a `{"type":"lagged"}` notice and resumes
 //! from the oldest retained frame rather than being disconnected.
 //!
-//! Both routes sit behind `middleware::authenticated`, which reads the token
+//! `ticker` carries the CF Benchmarks 5Hz index frames and `coinbase_ticker`
+//! price frames; `orderbook` the Kalshi book; `coinbase_book` the top levels
+//! of the market's Coinbase spot and perp books.
+//!
+//! All routes sit behind `middleware::authenticated`, which reads the token
 //! from `?access_token=` on upgrades. It is checked at upgrade time only: an
 //! open socket is not closed when the token later expires.
 
@@ -50,6 +54,22 @@ pub async fn orderbook(
         books.iter().map(|(ticker, book)| book.snapshot_frame(ticker)).collect()
     };
     Ok(ws.on_upgrade(move |socket| pump(socket, rx, snapshots, tag, "orderbook")))
+}
+
+/// `GET /ws/{tag}/coinbase-book`
+pub async fn coinbase_book(
+    Path(tag): Path<String>,
+    State(state): State<AppState>,
+    user: AuthUser,
+    ws: WebSocketUpgrade,
+) -> Result<Response, AppError> {
+    let feed = state.feeds.get(&tag).await.ok_or_else(|| AppError::NotFound(format!("feed for '{tag}'")))?;
+    tracing::debug!(%tag, user = %user.id, "coinbase book upgrade authorized");
+    // Subscribe first, as in `orderbook`; each frame is a whole top of book,
+    // so an overlap only repeats a frame.
+    let rx = feed.coinbase_book_tx.subscribe();
+    let tops: Vec<String> = feed.coinbase_tops.read().await.values().map(|f| f.to_string()).collect();
+    Ok(ws.on_upgrade(move |socket| pump(socket, rx, tops, tag, "coinbase-book")))
 }
 
 async fn pump(
