@@ -42,7 +42,7 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// How often a changed book's top levels go out to proxy clients.
-pub const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+pub const PUBLISH_INTERVAL: Duration = Duration::from_millis(125);
 
 const SOURCE_TICKER: &str = "ws_ticker";
 const SOURCE_BOOK: &str = "ws_level2";

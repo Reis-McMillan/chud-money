@@ -25,7 +25,7 @@ use summary::SummarySnapshot;
 /// BRTI at 5 Hz plus Coinbase spot and perp prices on every match share it.
 const TICKER_CAPACITY: usize = 256;
 const ORDERBOOK_CAPACITY: usize = 1024;
-/// Coinbase top-of-book frames, at most 4 Hz per product.
+/// Coinbase top-of-book frames, at most 8 Hz per product.
 const COINBASE_BOOK_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, Default, Serialize)]
